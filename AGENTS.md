@@ -1,131 +1,291 @@
-# Codex instructions: `secretd`
+# Codex instructions: `viska`
 
 ## Goal
 
-Build **secretd**, a small, auditable Linux-only service for one-time transfer of sensitive text between processes/users **without using the desktop clipboard**. Any authorized producer submits bytes via standard input; a separately authorized consumer triggers the service to synthesize keyboard events into the active seat through `/dev/uinput`. Submission and triggering may be performed by **different Unix UIDs**. The service runs under its own dedicated system UID.
+Build **viska**, a small, auditable Linux-only service for one-time delivery of sensitive text between separately authorized processes or Unix users **without using the desktop clipboard**.
 
-This project is **application-agnostic**: do not integrate it with `pass`, password managers, X11, Wayland, portals, or a particular desktop environment.
+Provide **`viskad`**, a persistent daemon running under a dedicated, non-login, non-root system account of the same name, and **`viskactl`**, a CLI with `store`, `type`, `clear`, and `status` commands. Submission and triggering may be performed by different Unix UIDs. Only the daemon accesses `/dev/uinput`.
+
+NixOS is the required installation target. Deliver a Nix package, importable NixOS module, standalone interactive test applications, automated tests, and complete installation and operational documentation.
+
+Remain application-agnostic: do not integrate the service with password managers, clipboard APIs, X11, Wayland, portals, desktop environments, or shortcut systems. A graphical session in a disposable test VM is a test fixture, not a production dependency.
 
 ## Desired user experience
 
 ```sh
-printf '%s' 'example-secret' | secretctl store
-# ... focus a target text field ...
-secretctl type
-# or: secretctl clear
-secretctl status  # metadata only: never return the secret
+printf '%s' 'example-secret' | viskactl store
+# ... focus the intended text field ...
+viskactl type
+viskactl clear
+viskactl status  # metadata only: never return the secret
 ```
 
-The producer can exit after a successful `store`. `secretctl type` is a separate invocation, possibly under another UID. A service must persist between these operations.
-
-`secretctl type` **never prints or returns secret bytes**. It requests a one-shot injection by `secretd`.
+- The producer may exit after acknowledged storage; the daemon persists between commands.
+- A separately authorized user can trigger typing without receiving secret bytes or needing device permissions.
+- Accept secrets exclusively through stdin, never through arguments, environment variables, configuration, or temporary files.
+- Never return secret contents through an API, status response, log, tracing span, panic, error, or debugging facility.
 
 ## Architecture
 
 ```text
- producer UID A                    trigger UID B
-      |                                  |
- stdin -> secretctl store         secretctl type/clear/status
-      |                                  |
-      v                                  v
- restricted submission IPC         restricted control IPC
-      |                                  |
-      +--------------+-------------------+
-                     |
-                     v
-          secretd (dedicated system UID)
-          - one pending secret in memory
-          - expiration and one-shot state
-          - restricted access to /dev/uinput
-                     |
-                     v
-          Linux virtual keyboard -> active seat
+ producer UID A                         trigger UID B
+      |                                      |
+ stdin -> viskactl store                viskactl type/clear/status
+      |                                      |
+ restricted submission socket          restricted control socket
+      |                                      |
+      +------------------+-------------------+
+                         |
+                  viskad (system UID)
+                  - username authorization
+                  - one pending secret
+                  - protected memory and expiry
+                  - one-shot consumption
+                         |
+                     /dev/uinput
+                         |
+                  virtual keyboard
+                         |
+                  focused destination
 ```
 
-### IPC and authorization
+## Configuration and authorization
 
-- Prefer a **write-only FIFO** for submission, as discussed. Provide a CLI that frames/validates submissions so secrets may contain newlines and do not require a terminating newline. A FIFO is a byte stream: explicitly handle record boundaries, partial writes, concurrent producers, EOF, and the `PIPE_BUF` atomicity limit. **Never assume one `read()` equals one message.** If a robust atomic-record protocol is awkward with the FIFO, document that clearly and propose a Unix-domain `SOCK_SEQPACKET` socket as a safer alternative *before implementing it*. Preserve the logical separation of submission and control.
-- Prefer a separate **Unix-domain control socket** for `type`, `clear`, and `status`. Authenticate callers using `SO_PEERCRED`; authorize based on explicitly configured UIDs/groups. Unix socket permissions are an additional barrier, not a replacement for credential checks.
-- Producer authorization and trigger authorization must be separate. A producer must not automatically gain the ability to trigger typing, and a trigger user must not have a read-secret capability.
-- Publish no API that returns secret bytes, including debugging, logs, status, or errors.
-- Create socket/FIFO paths under a systemd-managed `/run/secretd` directory with safe owner, permissions, and no writable-parent or symlink-replacement vulnerability. A dedicated service UID must be able to read the submission endpoint; producer UIDs should be able to write to it but not read it. Document ACL/group provisioning and verify effective access with tests.
-- Treat IPC payload sizes as untrusted. Enforce a configurable maximum (initial default: 4096 bytes) and fail closed on invalid or oversized submissions. Avoid accepting unauthenticated clients.
+### JSON configuration
 
-### Secret lifetime and concurrency
+Use one configuration format: JSON. The NixOS module generates root-owned `/etc/viska/config.json`, not writable by ordinary users. Systemd starts the packaged daemon with:
 
-- Keep **at most one pending secret**. A new valid submission atomically replaces the old one; never allow partially received bytes to become the active secret.
-- Default TTL: **45 seconds**, measured with a monotonic clock. TTL is configurable with a sensible maximum.
-- Clear on expiry, explicit `clear`, replacement, service shutdown, and after a `type` request has been accepted for consumption.
-- Enforce one-shot consumption using an atomic state transition; simultaneous `type` requests must not replay the secret. The daemon should serialize transitions in a single event loop or use a clearly correct lock.
-- If injection fails, report the failure without re-enabling replay by default. Document when/why partial typing may occur.
-- Do not persist the secret to disk or use the Linux kernel keyring in v1. We chose **daemon-owned protected memory** for the simpler single-consumer design.
-- Use a bounded sensitive buffer and limit copies. On Linux, attempt `mlock`, use `MADV_DONTDUMP` where applicable, disable core dumps and process dumpability as appropriate, and explicitly zeroize secret buffers and transient copies. Define behavior if locking fails (default: fail closed unless explicitly configured otherwise). These are defense-in-depth protections, not guarantees against root or a compromised daemon.
-- Avoid placing secrets in argv, environment variables, journal/log output, tracing spans, panic messages, or temporary files.
+```sh
+viskad --config /etc/viska/config.json
+```
 
-### Keyboard injection
+Example configuration (account names are illustrative):
 
-- Implement injection through **Linux `/dev/uinput`**, not clipboard APIs, `xdotool`, `wtype`, or any desktop protocol. Use a narrowly scoped virtual keyboard device. `secretd` should be given specific `/dev/uinput` access rather than broad access to physical input devices.
-- Create and manage a virtual keyboard. Prefer keeping it registered for the service lifetime to avoid hotplug discovery delays and dropped initial events. Clean it up on shutdown.
-- Generate balanced key-down/key-up events with `EV_SYN` boundaries and ensure error paths release held modifiers.
-- **Character encoding/layout is a hard constraint:** `/dev/uinput` injects keycodes, not Unicode text. Never assume that arbitrary UTF-8 will type correctly under every keyboard layout. For the first milestone, explicitly support a documented character set and layout (e.g. printable ASCII on a configured US layout); reject unsupported characters instead of silently typing wrong bytes. Make the translation layer independently testable. Design for future configurable layout support.
-- Targeting is by the active input seat/focused application, **not by window identity**. Document multi-seat, virtual-terminal, lock-screen, focus-stealing, and unintended-destination risks. Do not claim perfect seat isolation without implementation and testing.
-- The `type` command must not need permission to access `/dev/uinput`; only the service does.
+```json
+{
+  "keyboard_layout": "us",
+  "ttl_seconds": 45,
+  "max_payload_bytes": 1048576,
+  "authorization": {
+    "store_users": ["producer"],
+    "type_users": ["trigger"],
+    "clear_users": ["trigger"],
+    "status_users": ["producer", "trigger"]
+  }
+}
+```
 
-### Triggering
+- Reject unknown fields, duplicate keys, invalid types, and out-of-range values.
+- Missing authorization lists default to empty and grant no access.
+- Configuration contains settings and account names, never secret values. Keep secrets out of Nix expressions, the Nix store, and generated configuration.
+- Configuration changes require a daemon restart, clearing pending secrets. Do not implement live reload in v1.
+- Support explicit endpoint-path configuration for isolated tests; production endpoints live under `/run/viska`.
 
-- V1 trigger: `secretctl type` through the authenticated control socket. This command is suitable for binding to any existing shortcut system.
-- Keep hotkey handling outside the core service. A small USB HID button or evdev shortcut handler is an optional later feature, **not required for v1**. Do not request broad access to `/dev/input/event*` in v1.
-- The act of triggering does not authenticate the *destination*. Clearly warn users that typing goes to the currently focused application and a physical button alone is not an authentication factor.
+### Username-based authorization
 
-### Service and deployment
+Expose usernames, not fixed numeric UIDs, in JSON and NixOS configuration:
 
-- Linux and systemd are initial targets; Nix/NixOS packaging is desirable.
-- Dedicated non-login, non-root system account (`secretd`) with minimum necessary device access and systemd hardening. Explicitly document how `/dev/uinput` permissions are granted; never rely on world-writable device permissions or unrestricted groups.
-- Provide systemd service configuration, a sample NixOS module (if practical), and instructions to authorize separate producer and trigger identities.
-- Prefer a small, reviewable implementation in **Rust** or **C**; choose based on the repository's existing language/tooling. Avoid unnecessary frameworks and dependencies. If starting from an empty repo, Rust is preferred for IPC parsing and state management, while using Linux interfaces directly or through narrow crates.
-- Don't assume root privileges for ordinary `secretctl` commands.
+```nix
+services.viska = {
+  enable = true;
+  keyboardLayout = "se"; # Explicit Swedish selection; the default is "us".
 
-## Suggested implementation order
+  authorization = {
+    storeUsers = [ "producer" ];
+    typeUsers = [ "trigger" ];
+    clearUsers = [ "trigger" ];
+    statusUsers = [ "producer" "trigger" ];
+  };
+};
+```
 
-1. Inspect the repository and write a brief plan identifying the language, IPC protocol, service model, keycode/layout strategy, and permission model. Note any deviations from this spec.
-2. Implement the state machine and bounded protected buffer, with deterministic unit tests for expiry, replacement, clearing, and concurrent one-shot consumption.
-3. Implement the authorization and IPC protocol, including a real cross-UID integration test or a documented privileged test harness.
-4. Implement a mockable keyboard backend and unit-test event sequences and unsupported-character failures.
-5. Add the real `/dev/uinput` backend, with a manual smoke-test procedure for a disposable test session.
-6. Add the CLI (`store`, `type`, `clear`, `status`), help text, service deployment, and hardening.
-7. Add automated tests, security review notes, and operational documentation. Keep each step small and testable.
+- Authenticate connections using kernel-provided `SO_PEERCRED` before processing payloads; never trust a client-supplied identity.
+- For each request, resolve the relevant configured usernames through the running system's account database and compare their UIDs with the peer UID.
+- Resolve accounts at runtime, not during Nix builds. Do not retain permanent startup UID mappings. Account-resolution failures deny the affected operation.
+- Keep resolution bounded so account-database delays do not block expiry, injection cancellation, or control handling.
+- Independently authorize submission, typing, clearing, and status. Submission permission never implies trigger permission.
+- Use endpoint permissions, groups, or ACLs as additional barriers, not replacements for daemon checks or supplementary-group application authorization.
+- Authorization identifies a Unix account, not human intent. Any process acting as an authorized account can exercise its permissions.
+- Every authorized trigger can consume the shared pending secret, regardless of its producer. Per-secret recipient binding is outside v1.
 
-## Acceptance criteria
+## IPC and command semantics
 
-- An authorized user A can run `printf ... | secretctl store`, exit, and the daemon retains the pending secret until consumed or expired.
-- A distinct authorized user B can run `secretctl type` and cause exactly one injection attempt, without receiving the secret as output or needing `/dev/uinput` access.
-- An unauthorized UID cannot submit, trigger, clear, or inspect status unless explicitly authorized.
-- Concurrent submissions cannot interleave into a valid secret, and concurrent triggers cannot replay it.
-- Timeouts and replacement zeroize previous secrets; expired secrets cannot be typed.
-- Newlines and binary input are either correctly framed and supported or explicitly rejected with precise errors; never silently truncate.
-- The implementation does not touch the system clipboard or require X11/Wayland.
-- Unsupported characters/layouts fail explicitly; supported test strings produce the correct evdev event sequences.
-- The daemon never logs sensitive contents; memory-dump, swap, permission, and service-hardening choices are documented.
-- Tests run without a real `/dev/uinput` device using a mock backend. A separate manual test verifies the real backend.
+### Submission and control transport
 
-## Non-goals for v1
+- Use two pathname Unix-domain `SOCK_SEQPACKET` sockets: one for submission and one for control, under `/run/viska`.
+- This deliberately replaces the original FIFO preference: sockets provide peer credentials, isolated connections, record boundaries, and acceptance acknowledgments. A 4096-byte FIFO atomic-write limit cannot accommodate the agreed payload size and framing.
+- The default maximum secret payload is **1 MiB (1,048,576 bytes)**, excluding protocol overhead. Permit lower configured limits; larger limits are outside v1. Treat lengths as untrusted.
+- Use a versioned submission protocol with a declared total payload length, ordered packets carrying at most 16 KiB of payload each, and an explicit completion record. Each connection carries one submission.
+- Do not depend on sending a single 1 MiB socket message. Handle UTF-8 characters spanning packets, EOF, packet truncation, and failed sends/receives explicitly.
+- Reject malformed framing, unsupported versions, oversized declarations, excess bytes, incomplete transfers, and truncated packets. Never combine different connections' data or install partial data.
+- Permit one staged submission at a time; reject additional transfers as busy. Apply a five-second inactivity timeout and a thirty-second total transfer deadline.
+- Bound accepted control connections and response queues. Prevent stalled clients from exhausting resources or blocking expiry and cancellation.
+- Clients must not be able to modify the runtime directory or replace endpoints. Establish restrictive permissions before making endpoints available; reject unexpected existing filesystem objects rather than blindly replacing them. Document permission/ACL provisioning and test effective access.
 
-- Password manager integration, including `pass` wrappers or patched executables.
-- A graphical interface or desktop-specific clipboard and shortcut APIs.
-- Arbitrary Unicode text injection across every keyboard layout.
-- Synchronization over a network, cloud storage, multi-user secret retrieval, or secret history.
-- Guaranteeing the identity or safety of the currently focused window.
-- Kernel-keyring-based persistence or authentication via fingerprint/NFC.
+### Command contracts
+
+- **`store`** succeeds only after complete validation and atomic installation. Invalid, unsupported, oversized, or incomplete submissions preserve an existing valid secret.
+- **`type`** atomically consumes an unexpired secret before emitting events. Failure, cancellation, or client disconnection never restores it. Simultaneous triggers cannot replay it.
+- **`clear`** zeroizes pending data and cancels staged submission. During injection, acknowledge completion only after stopping further typing and attempting held-key release.
+- **`status`** returns only empty/pending/injecting state, remaining TTL where applicable, and backend readiness. Do not expose secret contents or length.
+- Reject stores and additional type requests while injecting. A successful type response means the backend accepted the event sequence; it does not prove application receipt or correct destination.
+- Document uncertain outcomes after connection loss. Never automatically retry a request that may already have taken effect.
+
+## Secret lifetime, concurrency, and protected memory
+
+- Use **Rust**, minimal dependencies, and narrow Linux interfaces. Serialize state transitions in one event loop; keep IPC and device operations nonblocking.
+- Maintain at most one pending secret and one bounded staging buffer. Atomically replace the pending value only after full validation. Transfer consumed data into injection ownership rather than copying the complete secret.
+- Default TTL: **45 seconds**, configurable from one to 300 seconds, starting at installation. Use Linux `CLOCK_BOOTTIME` so suspended time counts. Schedule proactive expiry cleanup and check expiry immediately before consumption.
+- Clear on expiry, replacement, explicit clear, injection completion or failure, and orderly shutdown. Never persist secrets or use the kernel keyring in v1.
+- Establish fixed-capacity protected buffers before receiving sensitive bytes. Use `mlock` and `MADV_DONTDUMP`; disable process dumpability and core dumps. Fail closed if required protections cannot be established.
+- Protect CLI input, daemon receive/staging buffers, and transient event data. Translate incrementally instead of constructing a full-secret event array. Limit copies and explicitly zeroize before unlocking or freeing memory.
+- Provision sufficient locked-memory limits without broad capabilities. Document prerequisites for both service and ordinary CLI execution; never silently weaken protections in the demo.
+- Document limits involving kernel IPC buffers, privileged inspection, abrupt termination, and hibernation. Do not claim that protected userspace buffers prevent every possible persistent copy.
+
+## Keyboard layouts and injection
+
+- Implement injection through Linux `/dev/uinput`, never clipboard APIs, `xdotool`, `wtype`, or desktop protocols. Give only the daemon narrowly scoped device access, without physical input-device access.
+- Provide configurable named mappings for **US (`us`, the default)** and **Swedish (`se`)**. Reject unknown layouts at startup.
+- Accept valid UTF-8 containing all characters directly mapped by the selected layout, including Shift and AltGr combinations. Swedish support must include `åäöÅÄÖ` and the layout's other directly mapped symbols.
+- Reject invalid UTF-8, control characters (including newline, tab, and NUL), and characters requiring dead-key or composition sequences. Do not normalize, transliterate, silently substitute, truncate, or append Enter.
+- Validate complete input before installing it; never echo offending input in errors.
+- Use reviewed static mappings derived from pinned XKB definitions, without a runtime XKB dependency. Keep translation independently testable; adding a layout requires mapping coverage and tests.
+- The configured mapping must match the target session's active layout. Viska does not discover or change desktop layout settings. Document held physical modifiers, Caps Lock, input methods, and layout switching as correctness constraints.
+- Keep a narrowly scoped virtual keyboard registered for the daemon's lifetime. Emit balanced key-down/key-up events with `EV_SYN` boundaries and track held keys.
+- Attempt bounded best-effort release on failure or cancellation; disable the backend if recovery fails. Do not guarantee successful release after device failure.
+- Pace injection without blocking cancellation or control handling. Bound injection attempts to five minutes; timeout cancels and consumes the secret.
+- Document startup discovery delays: registering a device does not prove a graphical session is listening. Provide a manual readiness smoke test.
+- Target the active input stack/focused application, not a window identity. V1 targets a tested single-seat installation without claiming destination authentication or perfect seat isolation. Document virtual-terminal, lock-screen, focus-stealing, multi-seat, and unintended-destination risks.
+
+## Triggering
+
+- V1 trigger: `viskactl type` through the authenticated control socket. It is an ordinary command, not a separate service started for each request.
+- Users may bind it through their existing shortcut system. Document releasing shortcut modifiers before injection.
+- Keep hardware-event and hotkey handling outside the core daemon. A USB HID button, foot pedal, or separate listener invoking the same command is an optional later component, not a required v1 deliverable.
+- A future listener should receive access only to its specific device and run as a trigger-authorized identity. Do not request broad access to `/dev/input/event*` in v1.
+- A physical button is not an authentication factor and does not authenticate the destination.
+
+## NixOS packaging and systemd integration
+
+### Required artifacts
+
+Provide a flake exposing a package installing both binaries, an importable NixOS module, a development shell, automated checks, a standalone demo, and an interactive VM launcher.
+
+The `services.viska` module must configure:
+
+- Package selection and enablement.
+- Dedicated `viskad` account and hardened `viskad.service`.
+- Independent username authorization lists.
+- Layout (default `us`), TTL, and payload limit.
+- JSON generation, runtime directory, endpoint permissions, and necessary ACL/group provisioning.
+- uinput module loading and narrowly scoped device permissions.
+- Sufficient locked-memory limits.
+
+### Service lifecycle and hardening
+
+- Start the system service at boot when enabled and keep it alive between commands. The daemon creates its own IPC endpoints; do not use socket activation in v1.
+- Use `Type=notify`. Report readiness after configuration validation, memory protection, endpoint setup, and virtual-keyboard registration. Readiness does not guarantee discovery by a graphical session.
+- Use systemd `RuntimeDirectory=viska` to manage `/run/viska`, with safe ownership and permissions allowing only the necessary client traversal/access.
+- Run the packaged daemon with `--config /etc/viska/config.json`; do not hardcode Nix store paths.
+- Combine `/dev/uinput` filesystem permissions with systemd device restrictions. `DeviceAllow` alone does not grant filesystem access. Never rely on world-writable devices, broad input groups, or sandbox settings that hide required device access.
+- Disable core dumps, prevent privilege escalation, and restrict filesystem access without breaking account resolution or injection.
+- Restart after crashes with rate limiting; every restart begins empty. Arrange a restart when generated configuration changes. Do not implement live reload in v1.
+- On orderly shutdown, stop injection, attempt key release, zeroize sensitive memory, and destroy the virtual keyboard. Preserve systemd's bounded shutdown behavior.
+- Log operational metadata and errors only. Document administration with `systemctl status/restart/stop viskad.service` and `journalctl -u viskad.service`.
+
+## Interactive testing before host installation
+
+The following commands are required deliverables, not prerequisites already present in this repository. They must work without incorporating viska into the host's NixOS configuration.
+
+### Standalone mock demo
+
+```sh
+nix run .#demo
+```
+
+- Open a temporary shell containing `viskactl` and a running mock-backed daemon.
+- Create a private `0700` runtime directory and temporary JSON configuration authorizing only the invoking username. Direct the CLI to isolated test endpoints, separate from production paths.
+- Preserve memory protections and report unmet prerequisites explicitly. Do not grant host device access or require host service installation.
+- Support interactive commands such as:
+
+```sh
+printf '%s' 'example-secret@123' | viskactl store
+viskactl status
+viskactl type
+viskactl status
+```
+
+- The mock validates event generation and reports completion without printing secrets or event sequences. It never injects into host applications.
+- On exit, stop the daemon and remove runtime artifacts. Demonstrate framing, validation, expiry, and one-shot behavior; do not claim this proves cross-UID isolation or real device operation.
+- Document how to select Swedish for an isolated demo and try nonsensitive Swedish text.
+
+### Disposable graphical NixOS VM
+
+```sh
+nix run .#test-vm
+```
+
+- Launch a repository-owned VM configuration importing the actual module, without importing the host's `/etc/nixos` configuration.
+- Include separate producer, trigger, and unauthorized users, normal service hardening and memory protection, guest `/dev/uinput`, and an ordinary graphical text field.
+- Explicitly configure Swedish (`se`) in both viska and the guest graphical session to exercise the nondefault layout.
+- Document storing nonsensitive text as the producer, focusing the guest field, and triggering typing as the authorized trigger user.
+- Exercise real uinput in the guest without injecting into host applications. Use disposable storage by default and do not share host home directories or clipboard services.
+- Print shutdown and cleanup instructions. Document display and virtualization prerequisites, and support slower software emulation for interactive use when KVM is unavailable.
+- Keep a separate manual host uinput smoke test after installation: guest success does not establish correctness in the host's desktop session.
+
+## Automated tests and acceptance criteria
+
+Expose at least these commands on x86_64 Linux:
+
+```sh
+nix flake check --no-build
+nix build .#checks.x86_64-linux.unit-tests
+nix build .#checks.x86_64-linux.integration
+```
+
+Use the actual NixOS module with a mock keyboard backend for automated cross-UID VM integration tests. Document KVM and builder prerequisites separately from ordinary unit tests. Tests not requiring a real uinput device must run using the mock backend.
+
+Required coverage:
+
+- Authorized producer A can store and exit; distinct authorized trigger B can consume exactly once without receiving secret bytes or needing device permissions.
+- Unauthorized accounts cannot submit, type, clear, or inspect status. Producer-only permission cannot trigger typing.
+- Username resolution handles missing users, lookup failures, and changed UID mappings without stale authorization.
+- US is the default; explicit Swedish configuration works through JSON and the NixOS module. Test all directly mapped characters, including Swedish letters and Shift/AltGr event sequences.
+- Reject unsupported characters, controls, and invalid UTF-8; handle valid multibyte characters spanning transport packets.
+- Accept supported input exactly 1 MiB long and reject one byte over the limit without truncation or replacement of existing valid data.
+- Concurrent producers cannot mix submissions; malformed, truncated, stalled, oversized, and disconnected transfers cannot install partial values.
+- Concurrent triggers cannot replay secrets. Cover expiry across simulated suspend, replacement, clearing, injection cancellation/failure, cleanup failure, and prevention of replay.
+- Cover protection failures and zeroization of owned sensitive buffers.
+- Validate strict JSON parsing, generated configuration, module evaluation, service readiness/restarts/shutdown, effective endpoint/device access, and demo cleanup.
+- Verify the product does not touch the clipboard or depend on desktop protocols.
+- Manually exercise real uinput in a disposable Swedish-layout VM with nonsensitive text, including Swedish letters and AltGr symbols.
+
+## Implementation order
+
+1. Establish these requirements and the protocol/state design before writing the service.
+2. Implement protected buffers, clock abstraction, state transitions, and deterministic tests.
+3. Implement US and Swedish translation tables and mock injection, including failures and cancellation.
+4. Implement JSON configuration, username authorization, authenticated IPC, and CLI.
+5. Add the standalone demo, Nix packaging, module, systemd integration, and cross-UID VM tests.
+6. Implement real uinput, the graphical VM, deployment hardening, security review notes, and operational documentation.
+
+Keep steps small and testable. Add tests with each subsystem rather than deferring them to the end.
+
+## Documentation and non-goals
+
+- README instructions must lead with standalone testing, then cover permanent NixOS incorporation, separate producer/trigger authorization, US default and Swedish selection, rebuilding, verification, troubleshooting, and removal.
+- Document partial typing, uncertain outcomes, potentially lengthy large-payload injection, memory protection, swap/hibernation, permissions, service hardening, and focus/seat risks.
+- No password-manager integration, production GUI, desktop-specific APIs, network synchronization, secret retrieval/history, arbitrary Unicode composition, kernel-keyring persistence, or fingerprint/NFC authentication in v1.
 
 ## Important security caveat
 
-This is a **secret-delivery mechanism**, not a secure attention key or trusted path. A malicious focused application, a keylogger, a compromised input stack, or a process with sufficiently elevated privileges can capture typed secrets. Avoid overstating the protection achieved by bypassing the clipboard.
+Viska is a **secret-delivery mechanism**, not a secure attention key or trusted path. A malicious focused application, keylogger, compromised input stack, or sufficiently privileged process may capture typed secrets. Bypassing the clipboard does not authenticate the destination or eliminate these threats.
 
 ## Instructions when working on this repository
 
-- Prioritize correctness, least privilege, clear failure modes, and testability over feature count.
-- Do not weaken privilege separation for convenience. If a requested feature requires additional capabilities, explain and isolate them.
-- Do not hardcode local usernames, UIDs, seats, device paths beyond standard Linux interfaces, or Nix store paths.
-- Prefer explicit errors to silent fallback, especially around security properties and keyboard translation.
-- Update README and tests with every externally visible behavior change.
-- Before declaring a milestone complete, run the available tests and report what was and was not tested (including whether real `uinput` was exercised).
+- Prioritize correctness, least privilege, explicit failure modes, and testability over feature count.
+- Do not weaken privilege separation for convenience. Explain and isolate any additional capabilities.
+- Do not hardcode local usernames, UIDs, seats, nonstandard device paths, or Nix store paths. Example account names must remain clearly illustrative.
+- Avoid unnecessary frameworks and dependencies. Prefer explicit errors to silent fallback, especially for authorization, memory protection, and translation.
+- Update README and tests with every externally visible implementation behavior change.
+- Before declaring a milestone complete, run available checks and report separately what passed and whether mock tests, cross-UID VM tests, real guest uinput, and real host uinput were exercised.

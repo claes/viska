@@ -1,0 +1,13 @@
+{
+  "xkeyboard_config_version": "2.41",
+  "model": "pc105",
+  "variant": "basic",
+  "sources_sha256": {
+    "symbols/us": "c48909ff9be8e13cb3b035d844f1d5674c225d7072b75ae1954fd2a4f427ffaf",
+    "symbols/se": "144159344ea3e4d4cec1a0e49738ff7b227308b34dd0af52cb7d43ca38759e51",
+    "symbols/latin": "fe44b3fb50d309a1d8c7f1497e6d7a0af33e791165d36e8966701b9f5a0262d9",
+    "types/extra": "14a3fc9749313ce38a8559c3fc48775c7705a04af89519062f0c0856350856b6",
+    "types/level5": "faabfcdb7c1324c3787846fb82e03746a0644d58e671907bd4e8ede308a4e652"
+  },
+  "scope": "Main alphanumeric ISO keys; direct characters under Shift/AltGr; no keypad or composition"
+}

@@ -248,7 +248,14 @@ mod tests {
             for row in rows {
                 k.prepare(l.lookup(char::from_u32(row[0]).unwrap()).unwrap())
                     .unwrap();
-                for (i, ev) in k.events.bytes().chunks_exact(EVENT_SIZE).enumerate() {
+                for (i, ev) in k
+                    .events
+                    .bytes()
+                    .as_chunks::<EVENT_SIZE>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
                     let ev = unsafe { &*ev.as_ptr().cast::<libc::input_event>() };
                     assert_eq!(ev.type_, if i % 2 == 0 { 1 } else { 0 });
                 }

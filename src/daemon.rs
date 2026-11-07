@@ -9,7 +9,9 @@ use crate::{
     state::State,
     Result, CHUNK,
 };
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -18,69 +20,125 @@ static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop(_: i32) {
     STOP.store(true, Ordering::Relaxed);
 }
-const MAX_CLIENTS: usize = 32;
-const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
-pub const MAGIC: &[u8; 8] = b"VISKA\0\x01\0";
-pub const COMMIT: &[u8] = b"COMMIT1";
-
-#[derive(PartialEq)]
+pub const COMMIT: &[u8] = b"COMMIT2";
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Request {
+    pub version: u8,
+    pub operation: String,
+    #[serde(default = "default_channel")]
+    pub channel: String,
+    #[serde(default)]
+    pub sync: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<usize>,
+}
+fn default_channel() -> String {
+    "default".into()
+}
+impl Request {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != 2 {
+            return Err("incompatible protocol version; use matching binaries");
+        }
+        let n = self.channel.as_bytes();
+        if n.is_empty()
+            || n.len() > 64
+            || !n[0].is_ascii_alphanumeric()
+            || !n
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+        {
+            return Err("invalid channel name");
+        }
+        if !matches!(
+            self.operation.as_str(),
+            "store" | "type" | "output" | "clear" | "status"
+        ) || (self.sync && !matches!(self.operation.as_str(), "type" | "output"))
+            || ((self.operation == "store") != self.length.is_some())
+        {
+            return Err("invalid request");
+        }
+        Ok(())
+    }
+    fn users<'a>(&self, c: &'a Config) -> &'a [String] {
+        match self.operation.as_str() {
+            "store" => &c.authorization.store_users,
+            "type" => &c.authorization.type_users,
+            "output" => &c.authorization.output_users,
+            "clear" => &c.authorization.clear_users,
+            _ => &c.authorization.status_users,
+        }
+    }
+}
+#[derive(Clone, Copy, PartialEq)]
 enum Phase {
-    Control,
-    Auth(u8),
     Header,
-    Data(usize),
+    Auth,
+    Ready,
+    Wait,
+    Reauth,
+    DeliverReady,
+    Data,
     Commit,
     End,
     Typing,
+    OutHeader,
+    OutData,
+    OutCommit,
+    OutAck,
     Reply,
+    Dead,
 }
 struct Client {
     id: u64,
     socket: Socket,
     store: bool,
-    uid: libc::uid_t,
+    uid: u32,
     phase: Phase,
+    request: Option<Request>,
+    secret: Option<Secret>,
+    cursor: usize,
     created: Duration,
     activity: Duration,
-    staging: Option<Secret>,
+    started: Duration,
+    next_event: Duration,
     reply: Vec<u8>,
 }
 impl Client {
-    fn reply(&mut self, message: &'static str) {
-        self.staging = None;
-        self.reply = message.as_bytes().to_vec();
+    fn json(&mut self, v: serde_json::Value) {
+        self.secret = None;
+        self.reply = serde_json::to_vec(&v).unwrap();
         self.phase = Phase::Reply;
         self.activity = boottime();
     }
-    fn error(&mut self, message: &'static str) {
-        self.staging = None;
-        self.reply = serde_json::to_vec(&serde_json::json!({"ok":false,"error":message})).unwrap();
-        self.phase = Phase::Reply;
-        self.activity = boottime();
+    fn ok(&mut self) {
+        self.json(serde_json::json!({"ok":true}));
     }
-}
-const OK: &str = "{\"ok\":true}";
-struct Injection {
-    owner: u64,
-    secret: Secret,
-    cursor: usize,
-    started: Duration,
-    next_event: Duration,
-}
-fn cancel(
-    injection: &mut Option<Injection>,
-    keyboard: &mut Keyboard,
-    clients: &mut [Client],
-    error: &'static str,
-) {
-    if let Some(inj) = injection.take() {
-        let _ = keyboard.release();
-        if let Some(owner) = clients.iter_mut().find(|c| c.id == inj.owner) {
-            owner.error(error);
-        }
-        // Dropping injection zeroizes the consumed secret, including on failure.
+    fn error(&mut self, e: &'static str) {
+        self.json(serde_json::json!({"ok":false,"error":e}));
+    }
+    fn channel(&self) -> &str {
+        self.request.as_ref().map_or("", |r| r.channel.as_str())
+    }
+    fn consumer(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Wait
+                | Phase::Reauth
+                | Phase::DeliverReady
+                | Phase::Typing
+                | Phase::OutHeader
+                | Phase::OutData
+                | Phase::OutCommit
+                | Phase::OutAck
+        )
+    }
+    fn active(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Typing | Phase::OutHeader | Phase::OutData | Phase::OutCommit | Phase::OutAck
+        )
     }
 }
 fn notify_ready() -> Result<()> {
@@ -110,24 +168,25 @@ fn notify_ready() -> Result<()> {
 pub fn run(config: Config) -> Result<()> {
     STOP.store(false, Ordering::Relaxed);
     unsafe {
-        libc::umask(0o117); // 0660 socket creation; protected parent is required.
+        libc::umask(0o117);
         libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
     }
     let layout = Layout::new(&config.keyboard_layout)?;
     let mut keyboard = Keyboard::new(config.backend, &layout)?;
     let mut scratch = Secret::new(CHUNK + 32)?;
-    // Prove that the maximum pending + staging allocation fits before readiness.
-    let reserve_a = Secret::new(config.max_payload_bytes)?;
-    let reserve_b = Secret::new(config.max_payload_bytes)?;
-    drop((reserve_a, reserve_b));
-    let submission = Listener::bind(&config.submission_socket)?;
+    // Preflight the configured worst case, then allocate secret slots on demand.
+    let mut reserves = Vec::new();
+    for _ in 0..2 * config.max_channels {
+        reserves.push(Secret::new(config.max_payload_bytes)?);
+    }
+    drop(reserves);
+    let submit = Listener::bind(&config.submission_socket)?;
     let control = Listener::bind(&config.control_socket)?;
     let resolver = Resolver::new();
-    let mut state = State::new();
+    let mut channels: BTreeMap<String, State> = BTreeMap::new();
     let mut clients: Vec<Client> = Vec::new();
-    let mut next_id = 1;
-    let mut injection: Option<Injection> = None;
+    let mut id = 0;
     notify_ready()?;
     eprintln!(
         "viskad: ready ({})",
@@ -139,330 +198,389 @@ pub fn run(config: Config) -> Result<()> {
     );
     while !STOP.load(Ordering::Relaxed) {
         let now = boottime();
-        state.expire(now);
-        // Bounded work per pass prevents connection floods starving timers.
-        for (listener, store) in [(&submission, true), (&control, false)] {
+        for s in channels.values_mut() {
+            s.expire(now);
+        }
+        channels.retain(|name, s| {
+            s.pending().is_some()
+                || clients
+                    .iter()
+                    .any(|c| c.channel() == name && !matches!(c.phase, Phase::Dead | Phase::Reply))
+        });
+        for (listener, store) in [(&submit, true), (&control, false)] {
             for _ in 0..8 {
                 let Some(socket) = listener.accept()? else {
                     break;
                 };
-                if clients.len() >= MAX_CLIENTS {
+                if clients.len() >= 32 {
                     let _ = socket.send(b"{\"ok\":false,\"error\":\"busy\"}");
                     continue;
                 }
-                let Ok(uid) = socket.peer_uid() else {
-                    continue;
-                };
-                let busy = store
-                    && (injection.is_some()
-                        || clients.iter().any(|c| c.store && c.phase != Phase::Reply));
-                let mut client = Client {
-                    id: next_id,
+                let Ok(uid) = socket.peer_uid() else { continue };
+                id += 1;
+                clients.push(Client {
+                    id,
                     socket,
                     store,
                     uid,
-                    phase: if store {
-                        Phase::Auth(b's')
-                    } else {
-                        Phase::Control
-                    },
+                    phase: Phase::Header,
+                    request: None,
+                    secret: None,
+                    cursor: 0,
                     created: now,
                     activity: now,
-                    staging: None,
+                    started: now,
+                    next_event: now,
                     reply: Vec::new(),
-                };
-                next_id += 1;
-                if busy {
-                    client.error("busy");
-                } else if store
-                    && !resolver.submit(client.id, uid, config.authorization.store_users.clone())
-                {
-                    client.error("authorization unavailable");
-                }
-                clients.push(client);
+                });
             }
         }
-        // Only metadata goes through the NSS worker; no sensitive buffers cross threads.
         while let Ok((id, allowed)) = resolver.rx.try_recv() {
-            let Some(index) = clients
-                .iter()
-                .position(|c| c.id == id && matches!(c.phase, Phase::Auth(_)))
-            else {
-                continue;
-            };
-            if now.saturating_sub(clients[index].activity) >= AUTH_TIMEOUT {
-                clients[index].error("authorization timeout");
-                continue;
-            }
-            if !allowed {
-                clients[index].error("not authorized");
-                continue;
-            }
-            let Phase::Auth(command) = clients[index].phase else {
-                continue;
-            };
-            match command {
-                b's' => {
-                    if injection.is_some() {
-                        clients[index].error("busy");
-                    } else {
-                        clients[index].phase = Phase::Header;
-                        clients[index].activity = now;
-                    }
-                }
-                b't' => {
-                    if injection.is_some() {
-                        clients[index].error("busy");
-                    } else if !keyboard.ready() {
-                        clients[index].error("keyboard unavailable");
-                    } else if let Some(secret) = state.take(boottime()) {
-                        let owner = clients[index].id;
-                        clients[index].phase = Phase::Typing;
-                        injection = Some(Injection {
-                            owner,
-                            secret,
-                            cursor: 0,
-                            started: now,
-                            next_event: now,
-                        });
-                        // A store already in flight cannot install during injection.
-                        for c in clients
-                            .iter_mut()
-                            .filter(|c| c.store && c.phase != Phase::Reply)
-                        {
-                            c.error("busy");
-                        }
-                    } else {
-                        clients[index].error("no pending secret");
-                    }
-                }
-                b'c' => {
-                    state.clear();
-                    cancel(
-                        &mut injection,
-                        &mut keyboard,
-                        &mut clients,
-                        "injection cancelled; partial typing possible",
-                    );
-                    for c in clients
-                        .iter_mut()
-                        .filter(|c| c.store && c.phase != Phase::Reply)
-                    {
-                        c.error("submission cancelled");
-                    }
-                    if keyboard.ready() {
-                        clients[index].reply(OK);
-                    } else {
-                        clients[index].error("key release failed; keyboard disabled");
-                    }
-                }
-                b'?' => {
-                    let remaining = state.remaining(now);
-                    let mode = if injection.is_some() {
-                        "injecting"
-                    } else if remaining.is_some() {
-                        "pending"
-                    } else {
-                        "empty"
-                    };
-                    clients[index].reply = serde_json::to_vec(&serde_json::json!({"ok":true,"state":mode,
-                        "ttl_remaining_ms":remaining.map(|r| r.as_millis() as u64), "backend_ready":keyboard.ready()})).unwrap();
-                    clients[index].phase = Phase::Reply;
-                    clients[index].activity = now;
-                }
-                _ => clients[index].error("invalid control command"),
-            }
-        }
-        let mut disconnected_owner = false;
-        clients.retain_mut(|c| {
-            if c.phase == Phase::Reply {
-                return match c.socket.send(&c.reply) {
-                    Ok(true) | Err(_) => false,
-                    Ok(false) => now.saturating_sub(c.activity) < IDLE_TIMEOUT,
-                };
-            }
-            if let Phase::Auth(_) = c.phase {
-                if now.saturating_sub(c.activity) >= AUTH_TIMEOUT {
-                    c.error("authorization timeout");
-                }
-                return true;
-            }
-            if c.phase != Phase::Typing
-                && (now.saturating_sub(c.activity) >= IDLE_TIMEOUT
-                    || (c.store && now.saturating_sub(c.created) >= TRANSFER_TIMEOUT))
+            if let Some(c) = clients
+                .iter_mut()
+                .find(|c| c.id == id && matches!(c.phase, Phase::Auth | Phase::Reauth))
             {
-                c.error("request timeout");
-                return true;
+                if now.saturating_sub(c.activity) >= Duration::from_secs(2) {
+                    c.error("authorization timeout");
+                } else if !allowed {
+                    c.error("not authorized");
+                } else {
+                    c.phase = if c.phase == Phase::Auth {
+                        Phase::Ready
+                    } else {
+                        Phase::DeliverReady
+                    };
+                }
             }
-            scratch.clear();
-            let packet = c.socket.recv(scratch.spare());
-            let n = match packet {
-                Ok(None) => return true,
-                Err("peer disconnected") if c.phase == Phase::End => {
-                    if let Some(secret) = c.staging.take() {
-                        if injection.is_some() {
-                            c.error("busy");
-                        } else if let Err(error) = layout.validate(secret.bytes()) {
-                            c.error(error);
-                        } else {
-                            state.install(
-                                secret,
-                                boottime(),
-                                Duration::from_secs(config.ttl_seconds),
-                            );
-                            c.reply(OK);
-                        }
-                    }
-                    return true;
-                }
-                Err(error) => {
-                    if c.phase == Phase::Typing {
-                        disconnected_owner = true;
-                        return false;
-                    }
-                    c.error(error);
-                    return true;
-                }
-                Ok(Some(n)) => n,
-            };
-            let _ = scratch.set_len(n);
-            c.activity = now;
-            let data = scratch.bytes();
-            match c.phase {
-                Phase::Control => {
-                    if n != 1 {
-                        c.error("invalid control command");
-                    } else {
-                        let names = match data[0] {
-                            b't' => Some(config.authorization.type_users.clone()),
-                            b'c' => Some(config.authorization.clear_users.clone()),
-                            b'?' => Some(config.authorization.status_users.clone()),
-                            _ => None,
-                        };
-                        if let Some(names) = names {
-                            c.phase = Phase::Auth(data[0]);
-                            if !resolver.submit(c.id, c.uid, names) {
-                                c.error("authorization unavailable");
-                            }
-                        } else {
-                            c.error("invalid control command");
-                        }
-                    }
-                }
-                Phase::Header => {
-                    if n != 16 || &data[..8] != MAGIC {
-                        c.error("invalid submission header");
-                    } else {
-                        let total = u64::from_le_bytes(data[8..16].try_into().unwrap());
-                        if total > config.max_payload_bytes as u64 {
-                            c.error("payload limit exceeded");
-                        } else {
-                            match Secret::new(config.max_payload_bytes) {
-                                Ok(s) => {
-                                    c.staging = Some(s);
-                                    c.phase = if total == 0 {
-                                        Phase::Commit
-                                    } else {
-                                        Phase::Data(total as usize)
-                                    };
-                                }
-                                Err(e) => c.error(e),
-                            }
-                        }
-                    }
-                }
-                Phase::Data(total) => {
-                    let staging = c.staging.as_mut().unwrap();
-                    if n > CHUNK || n > total - staging.bytes().len() {
-                        c.error("invalid data packet length");
-                    } else if let Err(e) = staging.append(data) {
-                        c.error(e);
-                    } else if staging.bytes().len() == total {
-                        c.phase = Phase::Commit;
-                    }
-                }
-                Phase::Commit => {
-                    if data == COMMIT {
-                        c.phase = Phase::End;
-                    } else {
-                        c.error("invalid completion record");
-                    }
-                }
-                Phase::End => c.error("excess submission data"),
-                Phase::Typing => {
-                    disconnected_owner = true;
-                    c.error("unexpected data during injection");
-                }
-                _ => (),
-            }
-            scratch.clear();
-            true
-        });
-        // recv may have filled scratch before a truncation/error: always wipe it.
-        scratch.clear();
-        if disconnected_owner {
-            cancel(
-                &mut injection,
-                &mut keyboard,
-                &mut clients,
-                "trigger disconnected; partial typing possible",
-            );
         }
-        if let Some(inj) = injection.as_mut() {
-            let result = if now.saturating_sub(inj.started) >= Duration::from_secs(300) {
-                Err("injection timeout; partial typing possible")
-            } else if now < inj.next_event {
-                Ok(())
-            } else {
-                // IPC readiness/flooding must not accelerate keyboard output.
-                inj.next_event = now + Duration::from_millis(1);
-                (|| {
-                    if keyboard.idle() && inj.cursor < inj.secret.bytes().len() {
-                        // Full UTF-8 validation occurred before installation;
-                        // bytes are immutable and cursor advances by char widths.
-                        // Avoid repeatedly scanning the entire remaining secret.
-                        let text = unsafe {
-                            std::str::from_utf8_unchecked(&inj.secret.bytes()[inj.cursor..])
+        let count = clients.len();
+        for _ in 0..count {
+            let mut c = clients.remove(0);
+            let result: Result<()> = (|| {
+                if matches!(c.phase, Phase::Auth | Phase::Reauth) {
+                    if now.saturating_sub(c.activity) >= Duration::from_secs(2) {
+                        return Err("authorization timeout");
+                    }
+                    return Ok(());
+                }
+                if c.phase == Phase::Reply {
+                    if !matches!(c.socket.send(&c.reply), Ok(false))
+                        || now.saturating_sub(c.activity) > Duration::from_secs(5)
+                    {
+                        c.phase = Phase::Dead;
+                    }
+                    return Ok(());
+                }
+                if c.phase == Phase::Ready {
+                    let r = c.request.as_ref().unwrap().clone();
+                    if matches!(r.operation.as_str(), "status" | "clear") {
+                        if r.operation == "clear" {
+                            let mut released = true;
+                            if let Some(s) = channels.get_mut(&r.channel) {
+                                s.clear();
+                            }
+                            for other in clients.iter_mut().filter(|o| {
+                                o.channel() == r.channel
+                                    && !matches!(o.phase, Phase::Reply | Phase::Dead)
+                            }) {
+                                if other.phase == Phase::Typing {
+                                    released &= keyboard.release().is_ok();
+                                }
+                                other.error("channel cleared; delivery cancelled");
+                            }
+                            if released {
+                                c.ok();
+                            } else {
+                                c.error("keyboard unavailable");
+                            }
+                        } else {
+                            let remaining = channels
+                                .get_mut(&r.channel)
+                                .and_then(|s| s.remaining(boottime()));
+                            let active = clients
+                                .iter()
+                                .find(|o| o.channel() == r.channel && o.consumer());
+                            let state = match active {
+                                Some(o) if o.phase == Phase::Typing => "injecting",
+                                Some(o) if o.active() => "outputting",
+                                _ if remaining.is_some() => "pending",
+                                Some(_) => "waiting",
+                                _ => "empty",
+                            };
+                            c.json(serde_json::json!({"ok":true,"state":state,"ttl_remaining_ms":remaining.map(|d|d.as_millis() as u64),"backend_ready":keyboard.ready()}));
+                        }
+                        return Ok(());
+                    }
+                    if !channels.contains_key(&r.channel) {
+                        if channels.len() >= config.max_channels {
+                            return Err("channel limit reached");
+                        }
+                        channels.insert(r.channel.clone(), State::new());
+                    }
+                    if r.operation == "store" {
+                        if clients.iter().any(|o| {
+                            o.channel() == r.channel
+                                && (o.active()
+                                    || matches!(o.phase, Phase::Data | Phase::Commit | Phase::End))
+                        }) {
+                            return Err("busy");
+                        }
+                        if r.length.unwrap() > config.max_payload_bytes {
+                            return Err("payload limit exceeded");
+                        }
+                        c.secret = Some(Secret::new(config.max_payload_bytes)?);
+                        c.phase = if r.length == Some(0) {
+                            Phase::Commit
+                        } else {
+                            Phase::Data
                         };
-                        let mut ch = text.chars().next().ok_or("invalid injection buffer")?;
+                    } else {
+                        if clients
+                            .iter()
+                            .any(|o| o.channel() == r.channel && o.consumer())
+                        {
+                            return Err("busy");
+                        }
+                        if r.operation == "type" && !keyboard.ready() {
+                            return Err("keyboard unavailable");
+                        }
+                        if !r.sync && channels[&r.channel].pending().is_none() {
+                            return Err("no pending secret");
+                        }
+                        if !r.sync
+                            && r.operation == "type"
+                            && clients.iter().any(|o| o.phase == Phase::Typing)
+                        {
+                            return Err("busy");
+                        }
+                        c.phase = Phase::Wait;
+                    }
+                }
+                if matches!(c.phase, Phase::Wait | Phase::DeliverReady) {
+                    scratch.clear();
+                    match c.socket.recv(scratch.spare()) {
+                        Ok(None) => (),
+                        Err("peer disconnected") => {
+                            c.phase = Phase::Dead;
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
+                        Ok(Some(_)) => return Err("unexpected packet"),
+                    }
+                    scratch.clear();
+                }
+                if c.phase == Phase::Wait {
+                    let r = c.request.as_ref().unwrap();
+                    if r.operation == "type" && !keyboard.ready() {
+                        return Err("keyboard unavailable");
+                    }
+                    if channels.get(&r.channel).and_then(State::pending).is_some()
+                        && (r.operation != "type"
+                            || !clients.iter().any(|o| o.phase == Phase::Typing))
+                    {
+                        c.activity = now;
+                        c.phase = Phase::Reauth;
+                        if !resolver.submit(c.id, c.uid, r.users(&config).to_vec()) {
+                            return Err("authorization unavailable");
+                        }
+                        return Ok(());
+                    }
+                }
+                if c.phase == Phase::DeliverReady {
+                    let r = c.request.as_ref().unwrap();
+                    if r.operation == "type" && !keyboard.ready() {
+                        return Err("keyboard unavailable");
+                    }
+                    let state = channels.get_mut(&r.channel).unwrap();
+                    state.expire(boottime());
+                    if state.pending().is_none()
+                        || (r.operation == "type"
+                            && clients.iter().any(|o| o.phase == Phase::Typing))
+                    {
+                        if r.sync {
+                            c.phase = Phase::Wait;
+                        } else {
+                            return Err("no pending secret");
+                        }
+                    } else {
+                        if r.operation == "type" {
+                            layout.validate(state.pending().unwrap().bytes())?;
+                        }
+                        c.secret = state.take(boottime());
+                        if c.secret.is_none() {
+                            if !r.sync {
+                                return Err("no pending secret");
+                            }
+                            c.phase = Phase::Wait;
+                            return Ok(());
+                        }
+                        c.started = now;
+                        c.next_event = now;
+                        c.cursor = 0;
+                        c.phase = if r.operation == "type" {
+                            Phase::Typing
+                        } else {
+                            Phase::OutHeader
+                        };
+                    }
+                }
+                if c.active() && now.saturating_sub(c.started) >= Duration::from_secs(300) {
+                    return Err("delivery timeout; partial delivery possible");
+                }
+                if matches!(
+                    c.phase,
+                    Phase::OutHeader | Phase::OutData | Phase::OutCommit
+                ) {
+                    let sent=match c.phase {
+                        Phase::OutHeader=>c.socket.send(&serde_json::to_vec(&serde_json::json!({"ok":true,"length":c.secret.as_ref().unwrap().bytes().len()})).unwrap())?,
+                        Phase::OutData=>{let bytes=c.secret.as_ref().unwrap().bytes(); let end=(c.cursor+CHUNK).min(bytes.len()); let sent=c.socket.send(&bytes[c.cursor..end])?; if sent {c.cursor=end;} sent},
+                        _=>c.socket.send(COMMIT)?,
+                    };
+                    if sent {
+                        c.phase = match c.phase {
+                            Phase::OutHeader if c.secret.as_ref().unwrap().bytes().is_empty() => {
+                                Phase::OutCommit
+                            }
+                            Phase::OutHeader => Phase::OutData,
+                            Phase::OutData
+                                if c.cursor == c.secret.as_ref().unwrap().bytes().len() =>
+                            {
+                                Phase::OutCommit
+                            }
+                            Phase::OutData => Phase::OutData,
+                            _ => {
+                                c.secret = None;
+                                if unsafe { libc::shutdown(c.socket.fd(), libc::SHUT_WR) } != 0 {
+                                    return Err("output shutdown failed");
+                                }
+                                Phase::OutAck
+                            }
+                        };
+                    }
+                    return Ok(());
+                }
+                if !matches!(c.phase, Phase::Typing | Phase::Wait | Phase::OutAck)
+                    && (now.saturating_sub(c.activity) > Duration::from_secs(5)
+                        || (c.store && now.saturating_sub(c.created) > Duration::from_secs(30)))
+                {
+                    return Err("request timeout");
+                }
+                scratch.clear();
+                match c.socket.recv(scratch.spare()) {
+                    Ok(None) => (),
+                    Err("peer disconnected") if c.phase == Phase::End => {
+                        let r = c.request.as_ref().unwrap();
+                        if clients
+                            .iter()
+                            .any(|o| o.channel() == r.channel && o.active())
+                        {
+                            return Err("busy");
+                        }
+                        channels.get_mut(&r.channel).unwrap().install(
+                            c.secret.take().unwrap(),
+                            boottime(),
+                            Duration::from_secs(config.ttl_seconds),
+                        );
+                        c.ok();
+                    }
+                    Err(e) => return Err(e),
+                    Ok(Some(n)) => {
+                        scratch.set_len(n)?;
+                        let data = scratch.bytes();
+                        c.activity = now;
+                        match c.phase {
+                            Phase::Header => {
+                                if n > 512 {
+                                    return Err("request header too large");
+                                }
+                                let r: Request = serde_json::from_slice(data)
+                                    .map_err(|_| "invalid request; protocol v2 required")?;
+                                r.validate()?;
+                                if c.store != (r.operation == "store") {
+                                    return Err("wrong endpoint");
+                                }
+                                if !resolver.submit(c.id, c.uid, r.users(&config).to_vec()) {
+                                    return Err("authorization unavailable");
+                                }
+                                c.request = Some(r);
+                                c.phase = Phase::Auth;
+                            }
+                            Phase::Data => {
+                                let total = c.request.as_ref().unwrap().length.unwrap();
+                                let secret = c.secret.as_mut().unwrap();
+                                if n > CHUNK || n > total - secret.bytes().len() {
+                                    return Err("invalid data packet length");
+                                }
+                                secret.append(data)?;
+                                if secret.bytes().len() == total {
+                                    c.phase = Phase::Commit;
+                                }
+                            }
+                            Phase::Commit if data == COMMIT => c.phase = Phase::End,
+                            Phase::OutAck if data == b"DONE2" => c.phase = Phase::Dead,
+                            _ => return Err("unexpected packet"),
+                        }
+                    }
+                }
+                scratch.clear();
+                if c.phase == Phase::Typing && now >= c.next_event {
+                    c.next_event = now + Duration::from_millis(1);
+                    let bytes = c.secret.as_ref().unwrap().bytes();
+                    if keyboard.idle() && c.cursor < bytes.len() {
+                        // Validated before consumption; cursor advances by UTF-8 widths.
+                        let mut ch = unsafe { std::str::from_utf8_unchecked(&bytes[c.cursor..]) }
+                            .chars()
+                            .next()
+                            .unwrap();
                         let stroke = layout.lookup(ch);
-                        inj.cursor += ch.len_utf8();
+                        c.cursor += ch.len_utf8();
                         ch.zeroize();
                         keyboard.prepare(stroke?)?;
                     }
                     keyboard.tick()?;
-                    Ok(())
-                })()
-            };
-            if let Err(error) = result {
-                cancel(&mut injection, &mut keyboard, &mut clients, error);
-            } else if injection
-                .as_ref()
-                .is_some_and(|i| i.cursor == i.secret.bytes().len() && keyboard.idle())
-            {
-                let done = injection.take().unwrap();
-                if let Some(c) = clients.iter_mut().find(|c| c.id == done.owner) {
-                    c.reply(OK);
+                    if c.cursor == c.secret.as_ref().unwrap().bytes().len() && keyboard.idle() {
+                        c.ok();
+                    }
+                }
+                Ok(())
+            })();
+            scratch.clear();
+            if let Err(e) = result {
+                if c.phase == Phase::Typing {
+                    let _ = keyboard.release();
+                }
+                if e == "peer disconnected" {
+                    c.phase = Phase::Dead;
+                } else {
+                    c.error(e);
                 }
             }
+            if c.phase != Phase::Dead {
+                clients.push(c);
+            }
         }
-        // Poll readiness for IPC, but cap sleeps for proactive expiry/NSS results.
-        let mut fds = Vec::with_capacity(clients.len() + 2);
-        for fd in [submission.fd(), control.fd()] {
-            fds.push(libc::pollfd {
-                fd,
+        let mut fds = vec![
+            libc::pollfd {
+                fd: submit.fd(),
                 events: libc::POLLIN,
                 revents: 0,
-            });
-        }
+            },
+            libc::pollfd {
+                fd: control.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
         for c in &clients {
-            // Auth packets must remain unread until the credentials are authorized.
-            if matches!(c.phase, Phase::Auth(_)) {
+            if matches!(c.phase, Phase::Auth | Phase::Reauth) {
                 continue;
             }
             fds.push(libc::pollfd {
                 fd: c.socket.fd(),
-                events: if c.phase == Phase::Reply {
+                events: if matches!(
+                    c.phase,
+                    Phase::Reply | Phase::OutHeader | Phase::OutData | Phase::OutCommit
+                ) {
                     libc::POLLOUT
                 } else {
                     libc::POLLIN
@@ -474,17 +592,51 @@ pub fn run(config: Config) -> Result<()> {
             libc::poll(
                 fds.as_mut_ptr(),
                 fds.len() as _,
-                if injection.is_some() { 1 } else { 10 },
+                if clients.iter().any(|c| c.phase == Phase::Typing) {
+                    1
+                } else {
+                    10
+                },
             );
         }
     }
-    cancel(
-        &mut injection,
-        &mut keyboard,
-        &mut clients,
-        "service stopping; partial typing possible",
-    );
-    state.clear();
+    let _ = keyboard.release();
+    drop(clients);
+    drop(channels);
     eprintln!("viskad: stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    #[test]
+    fn strict_version_channel_and_sync() {
+        let mut request = Request {
+            version: 2,
+            operation: "output".into(),
+            channel: "default".into(),
+            sync: true,
+            length: None,
+        };
+        request.validate().unwrap();
+        for name in ["", "../secret", "a/b", "a b", "å", "_hidden"] {
+            request.channel = name.into();
+            assert!(request.validate().is_err());
+        }
+        request.channel = "work_2-test".into();
+        request.validate().unwrap();
+        request.version = 1;
+        assert!(request.validate().is_err());
+        request.version = 2;
+        request.operation = "store".into();
+        request.length = Some(1);
+        assert!(request.validate().is_err());
+        request.sync = false;
+        request.validate().unwrap();
+        assert!(serde_json::from_slice::<Request>(
+            br#"{"version":2,"version":2,"operation":"output"}"#
+        )
+        .is_err());
+    }
 }

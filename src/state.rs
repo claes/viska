@@ -29,6 +29,9 @@ impl State {
         self.expire(now);
         self.pending.take().map(|(s, _)| s)
     }
+    pub fn pending(&self) -> Option<&Secret> {
+        self.pending.as_ref().map(|(s, _)| s)
+    }
     pub fn clear(&mut self) {
         self.pending = None;
     }

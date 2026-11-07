@@ -8,7 +8,6 @@ from pathlib import Path
 import pwd
 import resource
 import socket
-import struct
 import subprocess
 import tempfile
 import time
@@ -16,7 +15,6 @@ import unittest
 
 BIN = Path(os.environ.get('VISKA_BIN_DIR', 'target/debug')).resolve()
 USER = pwd.getpwuid(os.getuid()).pw_name
-MAGIC = b'VISKA\0\x01\0'
 
 class Service(unittest.TestCase):
     def setUp(self):
@@ -24,9 +22,9 @@ class Service(unittest.TestCase):
         # use a private child of the sticky /tmp instead, as the real demo does.
         self.temp = tempfile.TemporaryDirectory(prefix='viska-test-', dir='/tmp')
         self.root = Path(self.temp.name)
-        self.config = dict(backend='mock', keyboard_layout='se', ttl_seconds=45,
+        self.config = dict(backend='mock', keyboard_layout='se', ttl_seconds=45, max_channels=2,
             submission_socket=str(self.root / 'submit.sock'), control_socket=str(self.root / 'control.sock'),
-            authorization={k:[USER] for k in ['store_users','type_users','clear_users','status_users']})
+            authorization={k:[USER] for k in ['store_users','type_users','output_users','clear_users','status_users']})
         self.start()
     def start(self):
         path = self.root / 'config.json'; path.write_text(json.dumps(self.config))
@@ -48,8 +46,8 @@ class Service(unittest.TestCase):
         self.assertNotIn(b'public-fixture', err)
         self.assertFalse((self.root/'submit.sock').exists())
         self.temp.cleanup()
-    def ctl(self, command, value=None):
-        return subprocess.run([str(BIN/'viskactl'), command], input=value, env=self.env,
+    def ctl(self, command, value=None, channel="default", sync=False):
+        return subprocess.run([str(BIN/'viskactl'), command, '--channel', channel] + (['--sync'] if sync else []), input=value, env=self.env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=12)
     def status(self):
         result = self.ctl('status'); self.assertEqual(result.returncode, 0, result.stderr)
@@ -71,33 +69,36 @@ class Service(unittest.TestCase):
             try: reply = s.recv(2048)
             except ConnectionResetError: return {'ok': False}
             return json.loads(reply) if reply else {'ok': False}
-    def header(self, n): return MAGIC + struct.pack('<Q', n)
+    def header(self, n): return json.dumps(dict(version=2, operation='store', length=n)).encode()
     def test_persistence_swedish_and_one_shot(self):
         self.store('räksmörgås ÅÄÖ @ €'.encode())
         self.assertEqual(self.status(), 'pending')
         self.assertEqual(self.ctl('type').returncode, 0)
         self.assertEqual(self.ctl('type').returncode, 1)
         self.assertEqual(self.status(), 'empty')
-    def test_invalid_preserves_existing(self):
-        self.store(b'public-fixture')
+    def test_binary_output_and_type_validation(self):
         for value in [b'line\n', b'\xff', b'\0', '😀'.encode(), b'^']:
-            self.assertNotEqual(self.ctl('store', value).returncode, 0)
+            self.store(value)
+            self.assertNotEqual(self.ctl('type').returncode, 0)
             self.assertEqual(self.status(), 'pending')
+            result = self.ctl('output'); self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, value)
+        self.store(b''); self.assertEqual(self.ctl('output').stdout, b'')
     def test_limits_and_chunked_utf8(self):
         self.store(b'a' * 1048576)
         self.assertNotEqual(self.ctl('store', b'a'*1048577).returncode, 0)
         self.assertEqual(self.status(), 'pending')
         self.assertEqual(self.ctl('clear').returncode, 0)
         # A code point split across transport packets must still validate.
-        self.assertTrue(self.raw([self.header(2), b'\xc3', b'\xa5', b'COMMIT1'])['ok'])
+        self.assertTrue(self.raw([self.header(2), b'\xc3', b'\xa5', b'COMMIT2'])['ok'])
         self.assertEqual(self.status(), 'pending')
     def test_malformed_and_truncated_packets_preserve(self):
         self.store(b'old')
         cases = [[b'bad'], [self.header(1048577)], [self.header(3), b'a'],
                  [self.header(1), b'ab'], [self.header(1), b'a', b'bad'],
-                 [self.header(1), b'a', b'COMMIT1', b'extra'], [b'x'*20000],
-                 [self.header(1), b'a', b'COMMIT1', b'', b'extra'],
-                 [self.header(1), b'a', b'COMMIT1', b'']]
+                 [self.header(1), b'a', b'COMMIT2', b'extra'], [b'x'*20000],
+                 [self.header(1), b'a', b'COMMIT2', b'', b'extra'],
+                 [self.header(1), b'a', b'COMMIT2', b'']]
         for packets in cases:
             self.assertFalse(self.raw(packets)['ok'], packets[0][:16])
             self.assertEqual(self.status(), 'pending')
@@ -145,7 +146,7 @@ class Service(unittest.TestCase):
         self.daemon.terminate(); self.daemon.communicate(timeout=5)
         self.config['authorization'] = {k:[] for k in self.config['authorization']}
         self.start()
-        for cmd in ['store','type','clear','status']:
+        for cmd in ['store','type','output','clear','status']:
             result = self.ctl(cmd, b'x' if cmd == 'store' else None)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.stdout, b'')
@@ -186,5 +187,82 @@ class Service(unittest.TestCase):
         self.root.chmod(0o777)
         try: rejected()
         finally: self.root.chmod(0o700)
+
+    def test_channels_waiters_and_clear(self):
+        def waiting():
+            return subprocess.Popen([str(BIN/'viskactl'), 'output', '--sync', '--channel', 'work'], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        reader = waiting()
+        try:
+            for _ in range(100):
+                if json.loads(self.ctl('status', channel='work').stdout)['state'] == 'waiting': break
+                time.sleep(.02)
+            else: self.fail('consumer did not wait')
+            self.assertNotEqual(self.ctl('output', channel='work', sync=True).returncode, 0)
+            self.store(b'default-value')
+            self.assertEqual(self.ctl('store', b'work\n\0', channel='work').returncode, 0)
+            out, err = reader.communicate(timeout=5)
+            self.assertEqual(reader.returncode, 0, err); self.assertEqual(out, b'work\n\0')
+            self.assertEqual(self.ctl('output').stdout, b'default-value')
+        finally:
+            if reader.poll() is None: reader.terminate(); reader.communicate(timeout=5)
+        reader = waiting()
+        try:
+            self.store(b'keep-default')
+            time.sleep(.2); self.assertEqual(self.ctl('clear', channel='work').returncode, 0)
+            reader.communicate(timeout=5); self.assertNotEqual(reader.returncode, 0)
+            self.assertEqual(self.ctl('output').stdout, b'keep-default')
+        finally:
+            if reader.poll() is None: reader.terminate(); reader.communicate(timeout=5)
+    def test_disconnected_waiter_and_channel_limit(self):
+        reader = subprocess.Popen([str(BIN/'viskactl'), 'output', '--sync'], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(.2); reader.terminate(); reader.communicate(timeout=5)
+        self.store(b'kept'); self.assertEqual(self.ctl('output').stdout, b'kept')
+        for channel in ['a','b']: self.assertEqual(self.ctl('store', channel.encode(), channel=channel).returncode, 0)
+        self.assertNotEqual(self.ctl('store', b'c', channel='c').returncode, 0)
+        for channel in ['a','b']: self.assertEqual(self.ctl('output', channel=channel).stdout, channel.encode())
+    def test_output_authorization_is_separate(self):
+        self.daemon.terminate(); self.daemon.communicate(timeout=5)
+        self.config['authorization']['output_users'] = []
+        self.start(); self.store(b'x')
+        self.assertNotEqual(self.ctl('output').returncode, 0)
+        self.assertEqual(self.status(), 'pending'); self.assertEqual(self.ctl('type').returncode, 0)
+
+    def test_sync_type_beyond_old_timeouts(self):
+        reader = subprocess.Popen([str(BIN/'viskactl'), 'type', '--sync'], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            time.sleep(36)
+            self.assertIsNone(reader.poll())
+            self.store(b'hello')
+            out, err = reader.communicate(timeout=5)
+            self.assertEqual(reader.returncode, 0, err); self.assertEqual(out, b'')
+        finally:
+            if reader.poll() is None: reader.terminate(); reader.communicate(timeout=5)
+    def test_max_output_broken_pipe_and_clear(self):
+        value = bytes(range(256)) * 4096
+        self.store(value)
+        result = self.ctl('output'); self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, value)
+        for clear in [False, True]:
+            self.store(value)
+            reader = subprocess.Popen([str(BIN/'viskactl'), 'output'], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                time.sleep(.2)
+                if clear: self.assertEqual(self.ctl('clear').returncode, 0)
+                else: reader.stdout.close()
+                reader.wait(timeout=5)
+                self.assertNotEqual(reader.returncode, 0)
+                self.assertEqual(self.status(), 'empty')
+            finally:
+                if reader.poll() is None: reader.terminate(); reader.wait(timeout=5)
+                if reader.stdout: reader.stdout.close()
+                reader.stderr.close()
+    def test_parallel_channels(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda name: self.ctl('store', name.encode()*32768, channel=name), ['a','b']))
+        for result in results: self.assertEqual(result.returncode, 0, result.stderr)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda name: self.ctl('output', channel=name), ['a','b']))
+        for name, result in zip(['a','b'], results):
+            self.assertEqual(result.returncode, 0, result.stderr); self.assertEqual(result.stdout, name.encode()*32768)
 
 if __name__ == '__main__': unittest.main(verbosity=2)

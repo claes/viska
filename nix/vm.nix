@@ -13,6 +13,7 @@
   users.users = {
     root.initialPassword = "root";
     producer = { isNormalUser = true; initialPassword = "producer"; };
+    reader = { isNormalUser = true; initialPassword = "reader"; };
     trigger = { isNormalUser = true; initialPassword = "trigger"; };
     outsider = { isNormalUser = true; initialPassword = "outsider"; };
   };
@@ -21,6 +22,7 @@
     keyboardLayout = "se";
     authorization = {
       storeUsers = [ "producer" ]; typeUsers = [ "trigger" ];
+      outputUsers = [ "reader" ];
       clearUsers = [ "trigger" ]; statusUsers = [ "producer" "trigger" ];
     };
   };
@@ -41,7 +43,9 @@
       sleep 3; viskactl type
     Focus Mousepad during the three seconds. It should receive the text once.
     Subsequent typing fails. Test clear, expiry and unsupported characters too.
-    root/producer/trigger/outsider passwords equal their usernames (VM only).
+    Alternatively, su - reader and run viskactl output --channel work --sync,
+    then submit bytes to work as producer. Output writes exact bytes to stdout.
+    root/producer/trigger/reader/outsider passwords equal their usernames (VM only).
     Inspect the service as root with journalctl -u viskad.
     Shutdown using the desktop menu. Host home and clipboard are not shared.
   '';

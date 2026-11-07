@@ -6,18 +6,20 @@ let
   settings = {
     keyboard_layout = cfg.keyboardLayout;
     ttl_seconds = cfg.ttlSeconds;
+    max_channels = cfg.maxChannels;
     max_payload_bytes = cfg.maxPayloadBytes;
     backend = cfg.backend;
     authorization = {
       store_users = cfg.authorization.storeUsers;
       type_users = cfg.authorization.typeUsers;
+      output_users = cfg.authorization.outputUsers;
       clear_users = cfg.authorization.clearUsers;
       status_users = cfg.authorization.statusUsers;
     };
   };
   configFile = format.generate "viska-config.json" settings;
   clientUsers = lib.unique (cfg.authorization.storeUsers ++ cfg.authorization.typeUsers
-    ++ cfg.authorization.clearUsers ++ cfg.authorization.statusUsers);
+    ++ cfg.authorization.outputUsers ++ cfg.authorization.clearUsers ++ cfg.authorization.statusUsers);
   authOption = description: lib.mkOption {
     type = lib.types.listOf lib.types.str;
     default = [];
@@ -36,7 +38,8 @@ in {
       description = "Must match the target session's active keyboard layout.";
     };
     ttlSeconds = lib.mkOption { type = lib.types.ints.between 1 300; default = 45; description = "Pending lifetime including suspend."; };
-    maxPayloadBytes = lib.mkOption { type = lib.types.ints.between 1 1048576; default = 1048576; description = "Maximum UTF-8 submission size."; };
+    maxChannels = lib.mkOption { type = lib.types.ints.between 1 64; default = 8; description = "Maximum occupied channels."; };
+    maxPayloadBytes = lib.mkOption { type = lib.types.ints.between 1 1048576; default = 1048576; description = "Maximum arbitrary-byte submission size."; };
     backend = lib.mkOption {
       type = lib.types.enum [ "uinput" "mock" ]; default = "uinput";
       description = "Use mock only for isolated tests; mock never injects text.";
@@ -44,6 +47,7 @@ in {
     authorization = {
       storeUsers = authOption "Usernames allowed to submit text.";
       typeUsers = authOption "Usernames allowed to consume text through typing.";
+      outputUsers = authOption "Usernames allowed to retrieve bytes on stdout.";
       clearUsers = authOption "Usernames allowed to clear or cancel.";
       statusUsers = authOption "Usernames allowed to inspect metadata.";
     };
@@ -68,10 +72,10 @@ in {
       KERNEL=="uinput", SUBSYSTEM=="misc", OWNER="root", GROUP="viskad", MODE="0660", OPTIONS+="static_node=uinput"
     '';
     # The CLI also locks its stdin allocation. Users must log in again for PAM
-    # limits/group changes to apply; bounded 4 MiB soft/hard limit, not CAP_IPC_LOCK.
+    # limits/group changes to apply; bounded 8 MiB soft/hard limit, not CAP_IPC_LOCK.
     security.pam.loginLimits = map (name: {
-      domain = name; type = "-"; item = "memlock"; value = "4096";
-    }) cfg.authorization.storeUsers;
+      domain = name; type = "-"; item = "memlock"; value = "8192";
+    }) (lib.unique (cfg.authorization.storeUsers ++ cfg.authorization.outputUsers));
     systemd.services.viskad = {
       description = "Viska one-shot text delivery";
       wantedBy = [ "multi-user.target" ];
@@ -93,7 +97,7 @@ in {
         RestartSec = 2;
         TimeoutStartSec = 15;
         TimeoutStopSec = 5;
-        LimitMEMLOCK = "8M";
+        LimitMEMLOCK = "${toString (2 * cfg.maxChannels + 2)}M";
         LimitCORE = 0;
         NoNewPrivileges = true;
         CapabilityBoundingSet = "";

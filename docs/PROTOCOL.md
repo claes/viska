@@ -1,48 +1,45 @@
-# Local IPC protocol v1
+# Local IPC protocol v2
 
-Two pathname AF_UNIX/SOCK_SEQPACKET sockets: `submit.sock` and `control.sock`.
-Connections carry exactly one request. Authenticate using SO_PEERCRED; the
-submission endpoint checks store authorization before reading any payload.
-The control endpoint reads only an operation byte before checking its allowlist.
-No secret retrieval operation exists. Replies are single JSON metadata packets,
-`{"ok":true}` or `{"ok":false,"error":"fixed public message"}`. Status additionally
-returns `state`, `ttl_remaining_ms`, and `backend_ready`.
-If rejection closes a connection with unread packets, Linux may report a reset
-instead of delivering the metadata error packet. This still rejects the submission
-and does not replace the existing pending value.
+Use matching daemon and CLI versions. Submission and control remain separate
+AF_UNIX/SOCK_SEQPACKET pathname sockets with SO_PEERCRED authentication.
 
-Submission records:
+The first packet is JSON metadata, at most 512 bytes, with required `version:2`
+and `operation` (store/type/output/clear/status), optional `channel` (default
+"default"), optional `sync:false`, and `length` required only for store. Unknown
+fields, duplicate keys, invalid channel names and unsupported versions are errors.
+Only type/output allow sync. Store is accepted only on the submission endpoint.
+Authenticate the requested role before reading secret payloads. Never put secrets
+in the JSON metadata. Output has its own output_users username allowlist.
 
-1. A 16-byte header: bytes `56 49 53 4b 41 00 01 00` followed by an unsigned
-   little-endian 64-bit declared byte length (0–configured maximum, at most 1 MiB).
-2. Nonempty raw data packets of at most 16384 bytes, totaling exactly that length.
-   UTF-8 boundaries need not coincide with packets. Zero-byte values skip this step.
-3. One packet containing the seven ASCII bytes `COMMIT1`.
-4. Client calls `shutdown(SHUT_WR)` to establish end-of-record. Any further packet
-   is an error; no installation occurs before this EOF.
-5. Daemon validates complete UTF-8 and layout coverage, atomically replaces the
-   pending value, starts TTL, and sends an acknowledgment.
+Store sends nonempty raw packets up to 16384 bytes until its declared byte length
+is reached, then a COMMIT2 packet and shutdown(SHUT_WR). EOF is required before
+atomic installation. Empty records, excess data, truncation, ancillary descriptors,
+incomplete transfers, and limits fail closed without replacing existing data.
+Zero-byte values send no data packets. Input is arbitrary bytes, not necessarily
+UTF-8 or typable. The daemon acknowledges installation with {"ok":true}.
 
-A client disconnect after completion can still leave a successfully installed
-value whose acknowledgment was lost. Client success requires the acknowledgment;
-failure after sending is an uncertain outcome, not permission to retry.
-Unexpected EOF, oversize/truncated packet, excess bytes, or malformed records
-cancel staging while preserving a valid pending value. Receive buffers are locked
-and wiped even after recv errors/truncation. No read-equals-message assumption is
-made for stdin: it is read repeatedly until EOF into a bounded locked allocation.
+Type validates the complete pending value before atomic consumption, then replies
+only after injection. Output atomically consumes and sends {"ok":true,"length":N},
+raw packets totaling N bytes, COMMIT2, then shutdown(SHUT_WR). The CLI validates
+the entire transfer into locked memory before writing exact bytes to stdout.
+It sends DONE2 after successful stdout writes. The channel remains occupied until
+completion/cancellation/disconnect or the five-minute delivery deadline. No failure
+restores consumed data. Successful stdout writes do not prove downstream processing.
 
-SO_PASSCRED record metadata distinguishes an empty packet from actual EOF;
-empty packets are rejected, including after COMMIT1. Application authorization
-still uses connection SO_PEERCRED. Unexpected ancillary data is rejected and any
-received SCM_RIGHTS descriptors are closed, including before truncation errors.
+Other replies contain JSON metadata only; errors use fixed public strings. A
+rejected connection may reset when unread packets remain. Status includes state
+(empty/pending/waiting/injecting/outputting), remaining TTL and backend readiness,
+but no secret bytes or length. Status and clear apply to the selected channel.
 
-Control packet: one byte `t` (type), `c` (clear), or `?` (status). Keep the connection
-open for the reply. Type replies only after completion/failure; client disconnect
-cancels ongoing injection without restoring the secret. Additional data during
-injection is a protocol error and cancels it.
+Synchronous consumers wait indefinitely and reserve a channel; only one consumer
+may wait. Resolve authorization on entry and again before delivery. Detect abandoned
+waiters before taking values. Clear cancels waiting and active operations and
+staging on the selected channel. Normal store success never waits for consumption.
 
-At most 32 accepted clients, listen backlog 16, one staging connection, and one
-NSS worker with eight queued jobs/results. Authorization has a two-second deadline;
-other idle requests have five seconds, and submissions have thirty seconds total.
-Expiry and cancellation run independently of stalled NSS. A permanently stuck NSS
-module can deny further work until restart but cannot create unbounded threads.
+Retain a 32-client cap, one bounded NSS worker, two-second authorization deadlines,
+five-second idle request limits, and thirty-second submission deadlines. Idle
+consumer waiting is exempt. Each occupied channel permits one pending or delivering
+value plus one staging allocation; per-channel and global channel caps bound memory.
+SO_PASSCRED distinguishes empty packets from EOF; authorization uses SO_PEERCRED.
+Unexpected ancillary data is rejected and received descriptors are closed. Always
+wipe receive buffers even on truncation/error. Never retry ambiguous delivery.

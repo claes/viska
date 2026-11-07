@@ -7,6 +7,7 @@ use std::{fs, path::PathBuf};
 pub struct Authorization {
     pub store_users: Vec<String>,
     pub type_users: Vec<String>,
+    pub output_users: Vec<String>,
     pub clear_users: Vec<String>,
     pub status_users: Vec<String>,
 }
@@ -15,6 +16,7 @@ pub struct Authorization {
 pub struct Config {
     pub keyboard_layout: String,
     pub ttl_seconds: u64,
+    pub max_channels: usize,
     pub max_payload_bytes: usize,
     pub authorization: Authorization,
     pub submission_socket: PathBuf,
@@ -32,6 +34,7 @@ impl Default for Config {
         Self {
             keyboard_layout: "us".into(),
             ttl_seconds: 45,
+            max_channels: 8,
             max_payload_bytes: MAX_PAYLOAD,
             authorization: Authorization::default(),
             submission_socket: "/run/viska/submit.sock".into(),
@@ -44,7 +47,9 @@ impl Config {
     pub fn parse(data: &[u8]) -> Result<Self> {
         // Deserialize directly into typed structs: duplicate fields are errors.
         let c: Self = serde_json::from_slice(data).map_err(|_| "invalid JSON configuration")?;
-        if !(1..=300).contains(&c.ttl_seconds) || !(1..=MAX_PAYLOAD).contains(&c.max_payload_bytes)
+        if !(1..=64).contains(&c.max_channels)
+            || !(1..=300).contains(&c.ttl_seconds)
+            || !(1..=MAX_PAYLOAD).contains(&c.max_payload_bytes)
         {
             return Err("configuration limits out of range");
         }
@@ -60,6 +65,7 @@ impl Config {
         for list in [
             &c.authorization.store_users,
             &c.authorization.type_users,
+            &c.authorization.output_users,
             &c.authorization.clear_users,
             &c.authorization.status_users,
         ] {

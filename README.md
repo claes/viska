@@ -1,7 +1,7 @@
 # Viska
 
 Viska delivers sensitive text once through a Linux virtual keyboard without using
-the desktop clipboard. `viskad` keeps one pending value in protected memory;
+the desktop clipboard. `viskad` keeps one pending value per channel in protected memory;
 `viskactl store` submits stdin and a separately authorized account runs
 `viskactl type`. US is the default layout; Swedish is explicitly supported.
 
@@ -47,10 +47,10 @@ viskactl type
 ```
 
 Both daemon and CLI fail closed when sensitive memory cannot be locked. Check
-`ulimit -l`: allow at least 4096 KiB for the demo and producer CLI. You may raise the
+`ulimit -l`: allow at least 8192 KiB for the demo and producer CLI. You may raise the
 soft limit up to your existing hard limit (`ulimit -Hl`); otherwise your login's
 memory-lock limit must be provisioned by an administrator. No unsafe fallback is
-provided. A daemon needs a little over 2 MiB; the NixOS service receives 8 MiB.
+provided. A daemon needs two maximum-sized allocations per channel plus scratch space.
 
 ### Disposable graphical VM: real guest typing
 
@@ -59,7 +59,7 @@ nix run .#test-vm
 ```
 
 This builds a separate NixOS configuration with the actual module, separate
-producer/trigger/outsider accounts, a Swedish graphical session, and real guest
+producer/trigger/reader/outsider accounts, a Swedish graphical session, and real guest
 uinput. It does not import your host configuration. A graphical display is needed;
 KVM is recommended, with slower QEMU software emulation as fallback.
 
@@ -181,36 +181,74 @@ and verify `viskad.service` is stopped. No secret history or persistent secret
 files exist. NixOS may retain the unused system account/group; review those
 separately if removing them is desired.
 
-## Behavior and constraints
+## Channels, output, and waiting for a copy
 
-- `store` reads stdin to EOF without removing a newline. It succeeds only after
-  complete validation and atomic installation. Invalid data preserves an older
-  valid pending value. The byte limit defaults to 1 MiB and can be lowered.
-- Input must be UTF-8 and directly typable on the selected basic layout. Newline,
-  tab, NUL, other controls, invalid encoding, and dead-key/composition sequences
-  fail explicitly. No normalization, substitution, clipboard use, or Enter.
-- `type` consumes before injection. Failure, disconnect, cancellation, or timeout
-  never restores the value. A partial prefix may already have been typed.
-- `clear` cancels staging and pending data; during injection it stops further
-  typing and attempts key release. Failed release disables the backend.
-- Status contains only state, remaining TTL, and backend readiness, never content
-  or length. Commands return nonzero on failure and do not retry automatically.
-- TTL is 1–300 seconds (default 45), measured from installation with suspend-aware
-  `CLOCK_BOOTTIME`. Expiry is checked proactively and before consumption.
-- One staged submission is permitted; concurrent stores may return busy. Incoming
-  data expires after five seconds idle or thirty seconds total. Stores and extra
-  triggers are rejected while injecting.
-- Typing is paced, with a five-minute deadline. A 1 MiB value can be stored, but a
-  sufficiently long injection will reach that deadline and stop after a prefix.
-- Matching a username authorizes its processes, not a human gesture. Any authorized
-  trigger can consume the shared pending value, regardless of who submitted it.
-- Focus may change midway. Lock screens, other VTs, or unintended applications may
-  receive events. Multi-seat isolation is not guaranteed. Match the session layout;
-  Caps Lock, held modifiers, input methods, or remapping can change output.
+All commands accept `--channel NAME`; omitted means `default`. A channel contains
+one pending value, independently of other channels. Channels share allowlists;
+channel names are public metadata, not access-control boundaries. Names are
+case-sensitive, at most 64 ASCII letters/digits/underscores/hyphens, beginning with
+a letter or digit. Never put sensitive content in channel names.
 
-Bind `viskactl type` using an existing shortcut system; release shortcut modifiers
-before injection. A dedicated USB button/listener can invoke the same command,
-but hardware handlers are outside v1 and a button does not authenticate a destination.
+```sh
+printf '%s' 'first' | viskactl store
+printf '%s' 'second' | viskactl store --channel work
+viskactl output --channel work  # exact bytes: second (no newline)
+viskactl type                  # consumes default through the keyboard
+```
+
+`store` accepts arbitrary bytes, including newlines, NUL, and invalid UTF-8. It
+never strips or changes input. `output` consumes once and writes the exact bytes.
+`type` validates UTF-8 and the configured layout before consuming; unsupported
+values remain pending and can be retrieved using `output`. It never synthesizes
+Enter for newline. All other operations and errors remain metadata-only.
+
+Output requires separate authorization, which defaults to deny:
+
+```nix
+services.viska.authorization.outputUsers = [ "reader" ];
+services.viska.maxChannels = 8; # default; configurable from 1 to 64
+```
+
+The JSON equivalents are `authorization.output_users` and `max_channels`.
+Type permission never implies output permission. Output users receive socket access
+and PAM memlock provisioning just as producers do. Configuration changes restart
+the service and clear all channels; update client and daemon together (protocol v2).
+
+For reverse-order delivery, start the consumer first:
+
+```sh
+# Terminal A: waits indefinitely, then prints a future value.
+viskactl output --channel work --sync
+# Terminal B:
+printf '%s' 'hello' | viskactl store --channel work
+```
+
+`type --sync` works the same way, but injects keyboard events. Existing values are
+consumed immediately. Only one consumer can wait on each channel; another returns
+busy. `clear --channel work`, Ctrl-C, disconnection, and daemon shutdown cancel
+waiting. Authorization is checked again before delivering a future value.
+`--sync` is only supported on type/output. Store still acknowledges installation,
+without waiting for consumption. Status reports waiting and outputting states too.
+
+- TTL is 1–300 seconds, default 45, starting at installation and including suspend.
+- Default payload limit is 1 MiB per value. Replacement never installs partial data.
+- The channel limit counts pending values, staging, waiting, and active delivery.
+  Empty inactive entries are reclaimed; status/clear do not allocate unknown names.
+- Different channels may submit and output concurrently. One staged store is allowed
+  per channel; stores to a channel actively delivering a value return busy.
+- One global keyboard can inject at a time. Synchronous typing waits for availability;
+  ordinary typing returns busy. Waiting does not extend a pending value's TTL.
+- Once delivery starts it has a five-minute deadline, and failures never restore the
+  value. Output completion means stdout writes completed, not downstream processing.
+  Broken pipes, cancellation, and device errors can leave partial output.
+- Values and event buffers remain locked and zeroized. The NixOS service provisions
+  memory for two maximum-sized buffers per channel plus scratch space. Local mock
+  demos default to two channels; raise `VISKA_DEMO_MAX_CHANNELS` and your memlock
+  limit together if more are needed. At least 8192 KiB is recommended for the demo.
+- Matching a username authorizes its processes, not a human gesture. The focused
+  destination is not authenticated. Caps Lock, held modifiers, remapping, input
+  methods, layout changes, focus switches, lock screens, VTs, and multiple seats
+  can change or redirect typing. A hardware listener remains outside v1.
 
 ## Tests and development
 

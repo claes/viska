@@ -1,10 +1,8 @@
 # Security review notes
 
-The daemon owns the only pending value. There is no clipboard use, secret read API,
-keyring, history, or intentional disk storage. At most one protected pending value
-and one staging value coexist. State transitions run in one event loop; consuming
-moves ownership before the first key event. Invalid submissions preserve pending
-state. Failed injection never re-enables replay.
+The daemon owns all pending values. There is no clipboard use or implicit secret read permission; output is a separately authorized read API. There is no
+keyring, history, or intentional disk storage. Each bounded channel owns at most one protected pending/delivering value and one staging value. State transitions run in one event loop; consuming
+moves ownership before the first key event. Invalid submissions preserve pending state. Arbitrary bytes are allowed; type-time validation preserves untypable values for output. Failed injection never re-enables replay.
 
 ## Memory boundary
 
@@ -63,3 +61,19 @@ or real input-stack behavior. The NixOS VM test exercises account separation and
 systemd deployment. The graphical VM exercises guest uinput with Swedish explicitly
 selected. A manual host test remains necessary for the actual session. Always
 report which checks ran; never infer real-device success from a mock test.
+
+## Protocol v2 channels and output
+
+Channels share operation allowlists and are not security boundaries. output_users
+defaults to deny independently of typing. Output bytes are intentionally disclosed
+to the authorized consumer and its stdout destination, including pipe/file/terminal
+buffers; protection cannot follow them into downstream applications. Binary values
+never pass through JSON or logs. The CLI validates the entire bounded output into
+locked memory before stdout, zeroizes it, and acknowledges successful writes.
+Delivery consumes before emission; broken pipes and partial failures never restore it.
+
+One synchronous consumer reserves a channel. Waiting is indefinite but bounded by
+client/channel caps. Disconnects are checked before consumption and usernames are
+resolved again before delivery. Clear cancels that channel's waiters/staging/active
+delivery only. Pending TTL is not extended by waiting. Active delivery is bounded
+to five minutes. NixOS sizes locked-memory limits for aggregate channel storage.

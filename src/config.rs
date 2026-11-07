@@ -5,7 +5,7 @@ use std::{fs, path::PathBuf};
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Authorization {
-    pub store_users: Vec<String>,
+    pub send_users: Vec<String>,
     pub type_users: Vec<String>,
     pub output_users: Vec<String>,
     pub clear_users: Vec<String>,
@@ -63,7 +63,7 @@ impl Config {
             }
         }
         for list in [
-            &c.authorization.store_users,
+            &c.authorization.send_users,
             &c.authorization.type_users,
             &c.authorization.output_users,
             &c.authorization.clear_users,

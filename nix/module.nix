@@ -10,7 +10,7 @@ let
     max_payload_bytes = cfg.maxPayloadBytes;
     backend = cfg.backend;
     authorization = {
-      store_users = cfg.authorization.storeUsers;
+      send_users = cfg.authorization.sendUsers;
       type_users = cfg.authorization.typeUsers;
       output_users = cfg.authorization.outputUsers;
       clear_users = cfg.authorization.clearUsers;
@@ -18,7 +18,7 @@ let
     };
   };
   configFile = format.generate "viska-config.json" settings;
-  clientUsers = lib.unique (cfg.authorization.storeUsers ++ cfg.authorization.typeUsers
+  clientUsers = lib.unique (cfg.authorization.sendUsers ++ cfg.authorization.typeUsers
     ++ cfg.authorization.outputUsers ++ cfg.authorization.clearUsers ++ cfg.authorization.statusUsers);
   authOption = description: lib.mkOption {
     type = lib.types.listOf lib.types.str;
@@ -45,7 +45,7 @@ in {
       description = "Use mock only for isolated tests; mock never injects text.";
     };
     authorization = {
-      storeUsers = authOption "Usernames allowed to submit text.";
+      sendUsers = authOption "Usernames allowed to submit text.";
       typeUsers = authOption "Usernames allowed to consume text through typing.";
       outputUsers = authOption "Usernames allowed to retrieve bytes on stdout.";
       clearUsers = authOption "Usernames allowed to clear or cancel.";
@@ -75,7 +75,7 @@ in {
     # limits/group changes to apply; bounded 8 MiB soft/hard limit, not CAP_IPC_LOCK.
     security.pam.loginLimits = map (name: {
       domain = name; type = "-"; item = "memlock"; value = "8192";
-    }) (lib.unique (cfg.authorization.storeUsers ++ cfg.authorization.outputUsers));
+    }) (lib.unique (cfg.authorization.sendUsers ++ cfg.authorization.outputUsers));
     systemd.services.viskad = {
       description = "Viska one-shot text delivery";
       wantedBy = [ "multi-user.target" ];

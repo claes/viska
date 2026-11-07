@@ -1,10 +1,26 @@
+# Current requirements: protocol v2 channels and stdout output
+
+This section supersedes conflicting v1 requirements below. The user explicitly authorized secret retrieval via `output`.
+
+- Every command accepts `--channel NAME`, default `default`. Names match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}` and are public metadata.
+- Keep one pending value per channel, not one globally. Channels share username allowlists; add independent `output_users` / NixOS `authorization.outputUsers`, default deny.
+- `store` accepts arbitrary bytes up to 1 MiB, including controls and invalid UTF-8. Validate keyboard compatibility only when `type` requests consumption. Failed validation preserves the pending value for `output`.
+- `output` consumes once and writes exact bytes to stdout without formatting or appended newline. Secret payloads use protected memory and binary IPC frames, never JSON/logs/errors. Metadata-only restrictions continue for all other commands.
+- `type --sync` and `output --sync` wait indefinitely for a value (and keyboard availability for typing). One waiting consumer per channel; other consumers return busy. Authorize on registration and again before delivery. Detect disconnects before consuming.
+- `store` returns on installation, without waiting for delivery. Delivery consumes before emission and never restores after failure. Output completion means writes to stdout completed, not downstream processing.
+- Clear cancels waiting, staged, and active requests on that channel only. Empty inactive channels are reclaimed. Default max_channels is 8, configurable 1–64; bound memory for pending plus replacement staging on every channel.
+- Allow independent concurrent stores and outputs across channels. Serialize keyboard injection globally. Keep five-minute active delivery deadlines; idle waiting has no delivery timeout.
+- Use version-2 bounded JSON request metadata with channel/operation/sync, and bounded raw binary payload frames. Reject incompatible clients; update CLI and daemon together.
+- Update NixOS locked-memory limits for aggregate storage, and PAM limits for output users too. Demo defaults to two channels and recommends 8 MiB memlock; never weaken protection.
+- Extend tests for binary output, independent output authorization, channel isolation, waiting/clear/disconnect, reauthorization, contention, resource limits, and failure without replay. Update documentation and VM tests.
+
 # Codex instructions: `viska`
 
 ## Goal
 
 Build **viska**, a small, auditable Linux-only service for one-time delivery of sensitive text between separately authorized processes or Unix users **without using the desktop clipboard**.
 
-Provide **`viskad`**, a persistent daemon running under a dedicated, non-login, non-root system account of the same name, and **`viskactl`**, a CLI with `store`, `type`, `clear`, and `status` commands. Submission and triggering may be performed by different Unix UIDs. Only the daemon accesses `/dev/uinput`.
+Provide **`viskad`**, a persistent daemon running under a dedicated, non-login, non-root system account of the same name, and **`viskactl`**, a CLI with `store`, `type`, `output`, `clear`, and `status` commands. Submission and triggering may be performed by different Unix UIDs. Only the daemon accesses `/dev/uinput`.
 
 NixOS is the required installation target. Deliver a Nix package, importable NixOS module, standalone interactive test applications, automated tests, and complete installation and operational documentation.
 

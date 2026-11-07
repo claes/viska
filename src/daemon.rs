@@ -20,7 +20,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop(_: i32) {
     STOP.store(true, Ordering::Relaxed);
 }
-pub const COMMIT: &[u8] = b"COMMIT2";
+pub const COMMIT: &[u8] = b"COMMIT3";
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -32,13 +32,15 @@ pub struct Request {
     pub sync: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
 }
 fn default_channel() -> String {
     "default".into()
 }
 impl Request {
     pub fn validate(&self) -> Result<()> {
-        if self.version != 2 {
+        if self.version != 3 {
             return Err("incompatible protocol version; use matching binaries");
         }
         let n = self.channel.as_bytes();
@@ -53,17 +55,26 @@ impl Request {
         }
         if !matches!(
             self.operation.as_str(),
-            "store" | "type" | "output" | "clear" | "status"
+            "send" | "type" | "output" | "clear" | "status"
         ) || (self.sync && !matches!(self.operation.as_str(), "type" | "output"))
-            || ((self.operation == "store") != self.length.is_some())
+            || ((self.operation == "send") != self.length.is_some())
         {
             return Err("invalid request");
+        }
+        if let Some(name) = &self.recipient {
+            if self.operation != "send"
+                || name.is_empty()
+                || name.len() > 256
+                || name.contains('\0')
+            {
+                return Err("invalid recipient");
+            }
         }
         Ok(())
     }
     fn users<'a>(&self, c: &'a Config) -> &'a [String] {
         match self.operation.as_str() {
-            "store" => &c.authorization.store_users,
+            "send" => &c.authorization.send_users,
             "type" => &c.authorization.type_users,
             "output" => &c.authorization.output_users,
             "clear" => &c.authorization.clear_users,
@@ -82,6 +93,8 @@ enum Phase {
     Data,
     Commit,
     End,
+    ValidateRecipient,
+    InstallReady,
     Typing,
     OutHeader,
     OutData,
@@ -93,7 +106,7 @@ enum Phase {
 struct Client {
     id: u64,
     socket: Socket,
-    store: bool,
+    send: bool,
     uid: u32,
     phase: Phase,
     request: Option<Request>,
@@ -104,6 +117,7 @@ struct Client {
     started: Duration,
     next_event: Duration,
     reply: Vec<u8>,
+    generation: Option<u64>,
 }
 impl Client {
     fn json(&mut self, v: serde_json::Value) {
@@ -207,7 +221,7 @@ pub fn run(config: Config) -> Result<()> {
                     .iter()
                     .any(|c| c.channel() == name && !matches!(c.phase, Phase::Dead | Phase::Reply))
         });
-        for (listener, store) in [(&submit, true), (&control, false)] {
+        for (listener, send) in [(&submit, true), (&control, false)] {
             for _ in 0..8 {
                 let Some(socket) = listener.accept()? else {
                     break;
@@ -221,7 +235,7 @@ pub fn run(config: Config) -> Result<()> {
                 clients.push(Client {
                     id,
                     socket,
-                    store,
+                    send,
                     uid,
                     phase: Phase::Header,
                     request: None,
@@ -232,20 +246,40 @@ pub fn run(config: Config) -> Result<()> {
                     started: now,
                     next_event: now,
                     reply: Vec::new(),
+                    generation: None,
                 });
             }
         }
         while let Ok((id, allowed)) = resolver.rx.try_recv() {
-            if let Some(c) = clients
-                .iter_mut()
-                .find(|c| c.id == id && matches!(c.phase, Phase::Auth | Phase::Reauth))
-            {
+            if let Some(c) = clients.iter_mut().find(|c| {
+                c.id == id
+                    && matches!(
+                        c.phase,
+                        Phase::Auth | Phase::Reauth | Phase::ValidateRecipient
+                    )
+            }) {
                 if now.saturating_sub(c.activity) >= Duration::from_secs(2) {
                     c.error("authorization timeout");
+                } else if c.phase == Phase::Reauth
+                    && channels.get(c.channel()).and_then(State::generation) != c.generation
+                {
+                    if !c.request.as_ref().unwrap().sync
+                        && channels.get(c.channel()).and_then(State::pending).is_none()
+                    {
+                        c.error("no pending secret");
+                    } else {
+                        c.phase = Phase::Wait;
+                    }
                 } else if !allowed {
-                    c.error("not authorized");
+                    c.error(if c.phase == Phase::ValidateRecipient {
+                        "invalid recipient"
+                    } else {
+                        "not authorized"
+                    });
                 } else {
-                    c.phase = if c.phase == Phase::Auth {
+                    c.phase = if c.phase == Phase::ValidateRecipient {
+                        Phase::InstallReady
+                    } else if c.phase == Phase::Auth {
                         Phase::Ready
                     } else {
                         Phase::DeliverReady
@@ -257,7 +291,10 @@ pub fn run(config: Config) -> Result<()> {
         for _ in 0..count {
             let mut c = clients.remove(0);
             let result: Result<()> = (|| {
-                if matches!(c.phase, Phase::Auth | Phase::Reauth) {
+                if matches!(
+                    c.phase,
+                    Phase::Auth | Phase::Reauth | Phase::ValidateRecipient
+                ) {
                     if now.saturating_sub(c.activity) >= Duration::from_secs(2) {
                         return Err("authorization timeout");
                     }
@@ -317,11 +354,24 @@ pub fn run(config: Config) -> Result<()> {
                         }
                         channels.insert(r.channel.clone(), State::new());
                     }
-                    if r.operation == "store" {
+                    if r.operation == "send" {
+                        if r.recipient.as_ref().is_some_and(|name| {
+                            !config.authorization.type_users.contains(name)
+                                && !config.authorization.output_users.contains(name)
+                        }) {
+                            return Err("recipient is not in a consumer allowlist");
+                        }
                         if clients.iter().any(|o| {
                             o.channel() == r.channel
                                 && (o.active()
-                                    || matches!(o.phase, Phase::Data | Phase::Commit | Phase::End))
+                                    || matches!(
+                                        o.phase,
+                                        Phase::Data
+                                            | Phase::Commit
+                                            | Phase::End
+                                            | Phase::ValidateRecipient
+                                            | Phase::InstallReady
+                                    ))
                         }) {
                             return Err("busy");
                         }
@@ -380,7 +430,14 @@ pub fn run(config: Config) -> Result<()> {
                     {
                         c.activity = now;
                         c.phase = Phase::Reauth;
-                        if !resolver.submit(c.id, c.uid, r.users(&config).to_vec()) {
+                        let state = channels.get(&r.channel).unwrap();
+                        c.generation = state.generation();
+                        if !resolver.authorize(
+                            c.id,
+                            c.uid,
+                            r.users(&config).to_vec(),
+                            state.recipient().map(str::to_owned),
+                        ) {
                             return Err("authorization unavailable");
                         }
                         return Ok(());
@@ -393,6 +450,13 @@ pub fn run(config: Config) -> Result<()> {
                     }
                     let state = channels.get_mut(&r.channel).unwrap();
                     state.expire(boottime());
+                    if state.generation() != c.generation {
+                        if !r.sync && state.pending().is_none() {
+                            return Err("no pending secret");
+                        }
+                        c.phase = Phase::Wait;
+                        return Ok(());
+                    }
                     if state.pending().is_none()
                         || (r.operation == "type"
                             && clients.iter().any(|o| o.phase == Phase::Typing))
@@ -406,7 +470,7 @@ pub fn run(config: Config) -> Result<()> {
                         if r.operation == "type" {
                             layout.validate(state.pending().unwrap().bytes())?;
                         }
-                        c.secret = state.take(boottime());
+                        c.secret = state.take_if(c.generation.unwrap(), boottime());
                         if c.secret.is_none() {
                             if !r.sync {
                                 return Err("no pending secret");
@@ -423,6 +487,26 @@ pub fn run(config: Config) -> Result<()> {
                             Phase::OutHeader
                         };
                     }
+                }
+                if c.phase == Phase::InstallReady {
+                    if boottime().saturating_sub(c.created) > Duration::from_secs(30) {
+                        return Err("request timeout");
+                    }
+                    let r = c.request.as_ref().unwrap();
+                    if clients
+                        .iter()
+                        .any(|o| o.channel() == r.channel && o.active())
+                    {
+                        return Err("busy");
+                    }
+                    channels.get_mut(&r.channel).unwrap().install(
+                        c.secret.take().unwrap(),
+                        r.recipient.clone(),
+                        boottime(),
+                        Duration::from_secs(config.ttl_seconds),
+                    );
+                    c.ok();
+                    return Ok(());
                 }
                 if c.active() && now.saturating_sub(c.started) >= Duration::from_secs(300) {
                     return Err("delivery timeout; partial delivery possible");
@@ -461,7 +545,7 @@ pub fn run(config: Config) -> Result<()> {
                 }
                 if !matches!(c.phase, Phase::Typing | Phase::Wait | Phase::OutAck)
                     && (now.saturating_sub(c.activity) > Duration::from_secs(5)
-                        || (c.store && now.saturating_sub(c.created) > Duration::from_secs(30)))
+                        || (c.send && now.saturating_sub(c.created) > Duration::from_secs(30)))
                 {
                     return Err("request timeout");
                 }
@@ -476,12 +560,15 @@ pub fn run(config: Config) -> Result<()> {
                         {
                             return Err("busy");
                         }
-                        channels.get_mut(&r.channel).unwrap().install(
-                            c.secret.take().unwrap(),
-                            boottime(),
-                            Duration::from_secs(config.ttl_seconds),
-                        );
-                        c.ok();
+                        if let Some(name) = &r.recipient {
+                            if !resolver.recipient(c.id, name.clone()) {
+                                return Err("authorization unavailable");
+                            }
+                            c.phase = Phase::ValidateRecipient;
+                            c.activity = boottime();
+                        } else {
+                            c.phase = Phase::InstallReady;
+                        }
                     }
                     Err(e) => return Err(e),
                     Ok(Some(n)) => {
@@ -494,9 +581,9 @@ pub fn run(config: Config) -> Result<()> {
                                     return Err("request header too large");
                                 }
                                 let r: Request = serde_json::from_slice(data)
-                                    .map_err(|_| "invalid request; protocol v2 required")?;
+                                    .map_err(|_| "invalid request; protocol v3 required")?;
                                 r.validate()?;
-                                if c.store != (r.operation == "store") {
+                                if c.send != (r.operation == "send") {
                                     return Err("wrong endpoint");
                                 }
                                 if !resolver.submit(c.id, c.uid, r.users(&config).to_vec()) {
@@ -517,7 +604,7 @@ pub fn run(config: Config) -> Result<()> {
                                 }
                             }
                             Phase::Commit if data == COMMIT => c.phase = Phase::End,
-                            Phase::OutAck if data == b"DONE2" => c.phase = Phase::Dead,
+                            Phase::OutAck if data == b"DONE3" => c.phase = Phase::Dead,
                             _ => return Err("unexpected packet"),
                         }
                     }
@@ -572,7 +659,10 @@ pub fn run(config: Config) -> Result<()> {
             },
         ];
         for c in &clients {
-            if matches!(c.phase, Phase::Auth | Phase::Reauth) {
+            if matches!(
+                c.phase,
+                Phase::Auth | Phase::Reauth | Phase::ValidateRecipient
+            ) {
                 continue;
             }
             fds.push(libc::pollfd {
@@ -613,11 +703,12 @@ mod request_tests {
     #[test]
     fn strict_version_channel_and_sync() {
         let mut request = Request {
-            version: 2,
+            version: 3,
             operation: "output".into(),
             channel: "default".into(),
             sync: true,
             length: None,
+            recipient: None,
         };
         request.validate().unwrap();
         for name in ["", "../secret", "a/b", "a b", "å", "_hidden"] {
@@ -628,14 +719,14 @@ mod request_tests {
         request.validate().unwrap();
         request.version = 1;
         assert!(request.validate().is_err());
-        request.version = 2;
-        request.operation = "store".into();
+        request.version = 3;
+        request.operation = "send".into();
         request.length = Some(1);
         assert!(request.validate().is_err());
         request.sync = false;
         request.validate().unwrap();
         assert!(serde_json::from_slice::<Request>(
-            br#"{"version":2,"version":2,"operation":"output"}"#
+            br#"{"version":3,"version":3,"operation":"output"}"#
         )
         .is_err());
     }

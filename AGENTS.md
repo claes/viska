@@ -1,16 +1,28 @@
-# Current requirements: protocol v2 channels and stdout output
+# Current requirements: recipient restrictions and protocol v3
+
+This section supersedes conflicting requirements below.
+
+- Rename the command to `send`, JSON authorization to `send_users`, and NixOS authorization to `sendUsers`. Do not retain old aliases; document the migration.
+- `send --recipient USER` optionally restricts both type and output to a username already in either consumer allowlist. The user must still have permission for the chosen operation. Omitted recipient retains shared-channel behavior.
+- Validate list membership and runtime account existence before installation; failures preserve the prior value. Keep the username with the individual value, never cache its UID permanently, and refresh authorization before consumption.
+- Bind authorization to a unique value generation. Replacement invalidates stale results, including negative results; never authorize a new value using a previous value's check.
+- Reject a non-recipient waiter without consuming, releasing its reservation. Clear/status retain their independent operation permissions. No recipient information is added to status.
+- Use protocol v3 and package 0.3.0, with bounded recipient metadata and matching client/daemon versions. Retain all channel, protected-memory, cancellation and one-shot guarantees.
+- Help must be readable, grouped and aligned, with global and command-specific usage, applicable flags, defaults, environment and examples. It must work without daemon contact or protected allocations.
+
+# Current requirements: protocol v3 channels and stdout output
 
 This section supersedes conflicting v1 requirements below. The user explicitly authorized secret retrieval via `output`.
 
 - Every command accepts `--channel NAME`, default `default`. Names match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}` and are public metadata.
 - Keep one pending value per channel, not one globally. Channels share username allowlists; add independent `output_users` / NixOS `authorization.outputUsers`, default deny.
-- `store` accepts arbitrary bytes up to 1 MiB, including controls and invalid UTF-8. Validate keyboard compatibility only when `type` requests consumption. Failed validation preserves the pending value for `output`.
+- `send` accepts arbitrary bytes up to 1 MiB, including controls and invalid UTF-8. Validate keyboard compatibility only when `type` requests consumption. Failed validation preserves the pending value for `output`.
 - `output` consumes once and writes exact bytes to stdout without formatting or appended newline. Secret payloads use protected memory and binary IPC frames, never JSON/logs/errors. Metadata-only restrictions continue for all other commands.
 - `type --sync` and `output --sync` wait indefinitely for a value (and keyboard availability for typing). One waiting consumer per channel; other consumers return busy. Authorize on registration and again before delivery. Detect disconnects before consuming.
-- `store` returns on installation, without waiting for delivery. Delivery consumes before emission and never restores after failure. Output completion means writes to stdout completed, not downstream processing.
+- `send` returns on installation, without waiting for delivery. Delivery consumes before emission and never restores after failure. Output completion means writes to stdout completed, not downstream processing.
 - Clear cancels waiting, staged, and active requests on that channel only. Empty inactive channels are reclaimed. Default max_channels is 8, configurable 1–64; bound memory for pending plus replacement staging on every channel.
 - Allow independent concurrent stores and outputs across channels. Serialize keyboard injection globally. Keep five-minute active delivery deadlines; idle waiting has no delivery timeout.
-- Use version-2 bounded JSON request metadata with channel/operation/sync, and bounded raw binary payload frames. Reject incompatible clients; update CLI and daemon together.
+- Use version-3 bounded JSON request metadata with channel/operation/sync, and bounded raw binary payload frames. Reject incompatible clients; update CLI and daemon together.
 - Update NixOS locked-memory limits for aggregate storage, and PAM limits for output users too. Demo defaults to two channels and recommends 8 MiB memlock; never weaken protection.
 - Extend tests for binary output, independent output authorization, channel isolation, waiting/clear/disconnect, reauthorization, contention, resource limits, and failure without replay. Update documentation and VM tests.
 
@@ -20,7 +32,7 @@ This section supersedes conflicting v1 requirements below. The user explicitly a
 
 Build **viska**, a small, auditable Linux-only service for one-time delivery of sensitive text between separately authorized processes or Unix users **without using the desktop clipboard**.
 
-Provide **`viskad`**, a persistent daemon running under a dedicated, non-login, non-root system account of the same name, and **`viskactl`**, a CLI with `store`, `type`, `output`, `clear`, and `status` commands. Submission and triggering may be performed by different Unix UIDs. Only the daemon accesses `/dev/uinput`.
+Provide **`viskad`**, a persistent daemon running under a dedicated, non-login, non-root system account of the same name, and **`viskactl`**, a CLI with `send`, `type`, `output`, `clear`, and `status` commands. Submission and triggering may be performed by different Unix UIDs. Only the daemon accesses `/dev/uinput`.
 
 NixOS is the required installation target. Deliver a Nix package, importable NixOS module, standalone interactive test applications, automated tests, and complete installation and operational documentation.
 
@@ -29,7 +41,7 @@ Remain application-agnostic: do not integrate the service with password managers
 ## Desired user experience
 
 ```sh
-printf '%s' 'example-secret' | viskactl store
+printf '%s' 'example-secret' | viskactl send
 # ... focus the intended text field ...
 viskactl type
 viskactl clear
@@ -46,7 +58,7 @@ viskactl status  # metadata only: never return the secret
 ```text
  producer UID A                         trigger UID B
       |                                      |
- stdin -> viskactl store                viskactl type/clear/status
+ stdin -> viskactl send                viskactl type/clear/status
       |                                      |
  restricted submission socket          restricted control socket
       |                                      |
@@ -83,7 +95,7 @@ Example configuration (account names are illustrative):
   "ttl_seconds": 45,
   "max_payload_bytes": 1048576,
   "authorization": {
-    "store_users": ["producer"],
+    "send_users": ["producer"],
     "type_users": ["trigger"],
     "clear_users": ["trigger"],
     "status_users": ["producer", "trigger"]
@@ -107,7 +119,7 @@ services.viska = {
   keyboardLayout = "se"; # Explicit Swedish selection; the default is "us".
 
   authorization = {
-    storeUsers = [ "producer" ];
+    sendUsers = [ "producer" ];
     typeUsers = [ "trigger" ];
     clearUsers = [ "trigger" ];
     statusUsers = [ "producer" "trigger" ];
@@ -140,7 +152,7 @@ services.viska = {
 
 ### Command contracts
 
-- **`store`** succeeds only after complete validation and atomic installation. Invalid, unsupported, oversized, or incomplete submissions preserve an existing valid secret.
+- **`send`** succeeds only after complete validation and atomic installation. Invalid, unsupported, oversized, or incomplete submissions preserve an existing valid secret.
 - **`type`** atomically consumes an unexpired secret before emitting events. Failure, cancellation, or client disconnection never restores it. Simultaneous triggers cannot replay it.
 - **`clear`** zeroizes pending data and cancels staged submission. During injection, acknowledge completion only after stopping further typing and attempting held-key release.
 - **`status`** returns only empty/pending/injecting state, remaining TTL where applicable, and backend readiness. Do not expose secret contents or length.
@@ -225,7 +237,7 @@ nix run .#demo
 - Support interactive commands such as:
 
 ```sh
-printf '%s' 'example-secret@123' | viskactl store
+printf '%s' 'example-secret@123' | viskactl send
 viskactl status
 viskactl type
 viskactl status
@@ -263,7 +275,7 @@ Use the actual NixOS module with a mock keyboard backend for automated cross-UID
 
 Required coverage:
 
-- Authorized producer A can store and exit; distinct authorized trigger B can consume exactly once without receiving secret bytes or needing device permissions.
+- Authorized producer A can send and exit; distinct authorized trigger B can consume exactly once without receiving secret bytes or needing device permissions.
 - Unauthorized accounts cannot submit, type, clear, or inspect status. Producer-only permission cannot trigger typing.
 - Username resolution handles missing users, lookup failures, and changed UID mappings without stale authorization.
 - US is the default; explicit Swedish configuration works through JSON and the NixOS module. Test all directly mapped characters, including Swedish letters and Shift/AltGr event sequences.

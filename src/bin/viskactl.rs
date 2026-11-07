@@ -35,25 +35,66 @@ fn receive(socket: &Socket, buffer: &mut Secret, deadline: Option<Duration>) -> 
         let _ = socket.wait(libc::POLLIN, 100);
     }
 }
+fn print_help(command: &str) {
+    if command.is_empty() {
+        println!("Viska — one-shot sensitive value delivery\n\nUsage:\n  viskactl <command> [options]\n\nCommands:\n  send       Read stdin and install a pending value\n  type       Consume a value through the virtual keyboard\n  output     Consume a value and write exact bytes to stdout\n  clear      Clear a channel and cancel its requests\n  status     Show channel metadata");
+    } else {
+        let synopsis = match command {
+            "send" => " [--recipient USER]",
+            "type" | "output" => " [--sync]",
+            _ => "",
+        };
+        println!("Usage:\n  viskactl {command} [options]{synopsis}");
+    }
+    println!("\nGeneral options:\n  --channel NAME     Channel name (default: default)\n  --socket-dir PATH  Override the IPC directory (default: /run/viska)\n  -h, --help         Show help");
+    if command.is_empty() || command == "send" {
+        println!("\nSend options:\n  --recipient USER   Restrict type/output to an authorized user\n\n  Reads exact stdin bytes, up to 1 MiB; no newline is stripped.\n  Success acknowledges installation, not consumption.");
+    }
+    if command.is_empty() || matches!(command, "type" | "output") {
+        println!("\nConsumer options:\n  --sync             Wait for a value (type/output only)\n\n  Output writes exact bytes without adding a newline.\n  Type requires a matching layout and uses the focused destination.\n  A recipient restriction never grants an operation permission.");
+    }
+    println!("\nEnvironment:\n  VISKA_SOCKET_DIR   IPC directory, overridden by --socket-dir\n\nRequests are one-shot and never automatically retried.");
+    if command.is_empty() || command == "send" {
+        println!("\nExamples:\n  printf '%s' 'hello' | viskactl send\n  printf '%s' 'hello' | viskactl send --channel work --recipient alice");
+    }
+    if command.is_empty() || matches!(command, "type" | "output") {
+        if !command.is_empty() {
+            println!("\nExample:");
+        }
+        println!(
+            "  viskactl {} --channel work --sync",
+            if command.is_empty() {
+                "output"
+            } else {
+                command
+            }
+        );
+    }
+}
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Usage: viskactl [--socket-dir PATH] [--channel NAME] store|type|output|clear|status [--sync]\nChannel defaults to default. --sync waits for a value (type/output only).\nstore reads arbitrary stdin bytes, up to 1 MiB. output consumes and writes exact bytes.\ntype consumes once through uinput; its layout must support the value. No automatic retries.");
-        return Ok(());
-    }
     let mut dir = std::env::var_os("VISKA_SOCKET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| "/run/viska".into());
     let mut r = Request {
-        version: 2,
+        version: 3,
         operation: String::new(),
         channel: "default".into(),
         sync: false,
         length: None,
+        recipient: None,
     };
+    let mut help = false;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
+            "-h" | "--help" => help = true,
+            "--recipient" => {
+                let name = iter.next().ok_or("missing recipient username")?.clone();
+                if r.recipient.replace(name).is_some() {
+                    return Err("duplicate recipient option");
+                }
+            }
             "--socket-dir" => dir = iter.next().ok_or("missing socket directory")?.into(),
             "--channel" => r.channel = iter.next().ok_or("missing channel")?.clone(),
             "--sync" => r.sync = true,
@@ -61,7 +102,19 @@ fn run() -> Result<()> {
             _ => return Err("unexpected argument"),
         }
     }
-    if r.operation == "store" {
+    if help {
+        if !r.operation.is_empty()
+            && !matches!(
+                r.operation.as_str(),
+                "send" | "type" | "output" | "clear" | "status"
+            )
+        {
+            return Err("unknown command");
+        }
+        print_help(&r.operation);
+        return Ok(());
+    }
+    if r.operation == "send" {
         r.length = Some(0);
     }
     r.validate()?;
@@ -74,7 +127,7 @@ fn run() -> Result<()> {
         libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
-    let mut input = if r.operation == "store" {
+    let mut input = if r.operation == "send" {
         Some(Secret::new(MAX_PAYLOAD + 1)?)
     } else {
         None
@@ -97,7 +150,7 @@ fn run() -> Result<()> {
         }
         r.length = Some(input.bytes().len());
     }
-    let socket = Socket::connect(&dir.join(if r.operation == "store" {
+    let socket = Socket::connect(&dir.join(if r.operation == "send" {
         "submit.sock"
     } else {
         "control.sock"
@@ -124,10 +177,18 @@ fn run() -> Result<()> {
         return Err("invalid response");
     }
     let reply: serde_json::Value = serde_json::from_slice(packet.bytes())
-        .map_err(|_| "invalid response; protocol v2 required")?;
+        .map_err(|_| "invalid response; protocol v3 required")?;
     if reply["ok"] != true {
         return Err(match reply["error"].as_str().unwrap_or("") {
             "not authorized" => "not authorized",
+            "invalid recipient" => "invalid or unresolved recipient",
+            "recipient is not in a consumer allowlist" => {
+                "recipient is not in a consumer allowlist"
+            }
+            "incompatible protocol version; use matching binaries" => {
+                "incompatible protocol version; use matching binaries"
+            }
+            "invalid request; protocol v3 required" => "invalid request; protocol v3 required",
             "busy" => "busy",
             "no pending secret" => "no pending secret",
             "channel limit reached" => "channel limit reached",
@@ -211,7 +272,7 @@ fn run() -> Result<()> {
             cursor += n as usize;
         }
         drop(value);
-        socket.send_wait(b"DONE2")?;
+        socket.send_wait(b"DONE3")?;
     } else if r.operation == "status" {
         let state = reply["state"]
             .as_str()

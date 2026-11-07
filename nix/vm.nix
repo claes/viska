@@ -21,7 +21,7 @@
     enable = true;
     keyboardLayout = "se";
     authorization = {
-      storeUsers = [ "producer" ]; typeUsers = [ "trigger" ];
+      sendUsers = [ "producer" ]; typeUsers = [ "trigger" ];
       outputUsers = [ "reader" ];
       clearUsers = [ "trigger" ]; statusUsers = [ "producer" "trigger" ];
     };
@@ -38,7 +38,7 @@
     Disposable Swedish-layout Viska test VM (nonsensitive values only).
     Open Mousepad and two terminals. In the producer terminal run:
       su - producer
-      printf '%s' 'räksmörgås ÅÄÖ @ €' | viskactl store
+      printf '%s' 'räksmörgås ÅÄÖ @ €' | viskactl send
     In a trigger terminal run:
       sleep 3; viskactl type
     Focus Mousepad during the three seconds. It should receive the text once.

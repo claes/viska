@@ -2,7 +2,7 @@
 
 Viska delivers sensitive text once through a Linux virtual keyboard without using
 the desktop clipboard. `viskad` keeps one pending value per channel in protected memory;
-`viskactl store` submits stdin and a separately authorized account runs
+`viskactl send` submits stdin and a separately authorized account runs
 `viskactl type`. US is the default layout; Swedish is explicitly supported.
 
 This is a secret-delivery mechanism, **not a trusted input path**. The focused
@@ -27,13 +27,13 @@ The command opens a temporary shell with a mock daemon, isolated sockets, and
 username authorization for your account. In that shell:
 
 ```sh
-printf '%s' 'example-secret@123' | viskactl store
+printf '%s' 'example-secret@123' | viskactl send
 viskactl status
 viskactl type
 viskactl type   # fails: consumed already
 ```
 
-Successful store/type/clear commands are silent. The mock exercises event generation
+Successful send/type/clear commands are silent. The mock exercises event generation
 but never types into host applications. Status returns only metadata. Exiting the
 shell stops the daemon and removes temporary runtime files.
 
@@ -42,7 +42,7 @@ For Swedish:
 ```sh
 VISKA_DEMO_LAYOUT=se nix run .#demo
 # In the demo shell:
-printf '%s' 'räksmörgås ÅÄÖ @ €' | viskactl store
+printf '%s' 'räksmörgås ÅÄÖ @ €' | viskactl send
 viskactl type
 ```
 
@@ -69,7 +69,7 @@ In one terminal:
 ```sh
 su - producer
 # VM-only password: producer
-printf '%s' 'räksmörgås ÅÄÖ @ €' | viskactl store
+printf '%s' 'räksmörgås ÅÄÖ @ €' | viskactl send
 ```
 
 In the trigger terminal:
@@ -112,7 +112,7 @@ checkout or repository URL):
             ttlSeconds = 45;
             maxPayloadBytes = 1048576;
             authorization = {
-              storeUsers = [ "producer" ];
+              sendUsers = [ "producer" ];
               typeUsers = [ "trigger" ];
               clearUsers = [ "trigger" ];
               statusUsers = [ "producer" "trigger" ];
@@ -158,7 +158,7 @@ The root-controlled `/etc/viska/config.json` is generated using `pkgs.formats.js
   "max_payload_bytes": 1048576,
   "backend": "uinput",
   "authorization": {
-    "store_users": ["producer"],
+    "send_users": ["producer"],
     "type_users": ["trigger"],
     "clear_users": ["trigger"],
     "status_users": ["producer", "trigger"]
@@ -181,6 +181,38 @@ and verify `viskad.service` is stopped. No secret history or persistent secret
 files exist. NixOS may retain the unused system account/group; review those
 separately if removing them is desired.
 
+## Migration to 0.3.0
+
+Update the client and daemon together: this release uses protocol v3 and clears
+pending values on service restart. Rename `viskactl store` to `viskactl send`, JSON
+`authorization.store_users` to `authorization.send_users`, and NixOS
+`authorization.storeUsers` to `authorization.sendUsers`. Old names are rejected.
+The IPC filenames remain unchanged. View `viskactl --help` or `viskactl send --help`
+without contacting the daemon.
+
+## Restrict a value to a recipient
+
+```sh
+printf '%s' 'hello' | viskactl send --channel work --recipient alice
+```
+
+The example username must already appear in `typeUsers` or `outputUsers`, and must
+resolve on the running system. The restriction narrows existing permissions: alice
+still needs `outputUsers` to retrieve bytes or `typeUsers` to request typing. Every
+other account is denied both operations on this value, even if normally authorized.
+Omit `--recipient` for the previous shared-channel behavior. Names are public metadata.
+
+Invalid/unlisted/missing recipients reject the submission without replacing the
+previous value. The daemon resolves the recipient again before consumption, binding
+that check to the specific value's generation so replacements cannot reuse stale
+authorization. A waiting consumer for another user is rejected and releases its
+reservation; the value remains pending for its recipient. Clear and status keep
+their ordinary permissions. A replacement carries its own optional recipient;
+restrictions are per value, not permanent channel settings.
+
+Unix accounts sharing a UID are indistinguishable. Restricting who invokes typing
+does not authenticate the currently focused destination.
+
 ## Channels, output, and waiting for a copy
 
 All commands accept `--channel NAME`; omitted means `default`. A channel contains
@@ -190,13 +222,13 @@ case-sensitive, at most 64 ASCII letters/digits/underscores/hyphens, beginning w
 a letter or digit. Never put sensitive content in channel names.
 
 ```sh
-printf '%s' 'first' | viskactl store
-printf '%s' 'second' | viskactl store --channel work
+printf '%s' 'first' | viskactl send
+printf '%s' 'second' | viskactl send --channel work
 viskactl output --channel work  # exact bytes: second (no newline)
 viskactl type                  # consumes default through the keyboard
 ```
 
-`store` accepts arbitrary bytes, including newlines, NUL, and invalid UTF-8. It
+`send` accepts arbitrary bytes, including newlines, NUL, and invalid UTF-8. It
 never strips or changes input. `output` consumes once and writes the exact bytes.
 `type` validates UTF-8 and the configured layout before consuming; unsupported
 values remain pending and can be retrieved using `output`. It never synthesizes
@@ -212,7 +244,7 @@ services.viska.maxChannels = 8; # default; configurable from 1 to 64
 The JSON equivalents are `authorization.output_users` and `max_channels`.
 Type permission never implies output permission. Output users receive socket access
 and PAM memlock provisioning just as producers do. Configuration changes restart
-the service and clear all channels; update client and daemon together (protocol v2).
+the service and clear all channels; update client and daemon together (protocol v3).
 
 For reverse-order delivery, start the consumer first:
 
@@ -220,7 +252,7 @@ For reverse-order delivery, start the consumer first:
 # Terminal A: waits indefinitely, then prints a future value.
 viskactl output --channel work --sync
 # Terminal B:
-printf '%s' 'hello' | viskactl store --channel work
+printf '%s' 'hello' | viskactl send --channel work
 ```
 
 `type --sync` works the same way, but injects keyboard events. Existing values are
@@ -234,7 +266,7 @@ without waiting for consumption. Status reports waiting and outputting states to
 - Default payload limit is 1 MiB per value. Replacement never installs partial data.
 - The channel limit counts pending values, staging, waiting, and active delivery.
   Empty inactive entries are reclaimed; status/clear do not allocate unknown names.
-- Different channels may submit and output concurrently. One staged store is allowed
+- Different channels may submit and output concurrently. One staged send is allowed
   per channel; stores to a channel actively delivering a value return busy.
 - One global keyboard can inject at a time. Synchronous typing waits for availability;
   ordinary typing returns busy. Waiting does not extend a pending value's TTL.

@@ -62,7 +62,7 @@ systemd deployment. The graphical VM exercises guest uinput with Swedish explici
 selected. A manual host test remains necessary for the actual session. Always
 report which checks ran; never infer real-device success from a mock test.
 
-## Protocol v2 channels and output
+## Channels and output
 
 Channels share operation allowlists and are not security boundaries. output_users
 defaults to deny independently of typing. Output bytes are intentionally disclosed
@@ -77,3 +77,13 @@ client/channel caps. Disconnects are checked before consumption and usernames ar
 resolved again before delivery. Clear cancels that channel's waiters/staging/active
 delivery only. Pending TTL is not extended by waiting. Active delivery is bounded
 to five minutes. NixOS sizes locked-memory limits for aggregate channel storage.
+
+## Recipient restrictions
+
+Recipient usernames narrow the consumer allowlists for one value, including both
+stdout output and typing. They do not grant permissions, constrain clear/status,
+or authenticate the destination of keyboard events. Missing/unlisted accounts fail
+before installation. Consumption resolves the username afresh and checks peer UID.
+Accounts sharing a UID remain equivalent. Globally unique value generations bind
+NSS results to the value checked, preventing replacement/clear/recreation races
+from reusing stale authorization. A denied waiter does not consume the value.

@@ -13,7 +13,7 @@ user=$(id -un)
 jq -n --arg user "$user" --arg dir "$work" --arg layout "$layout" --argjson channels "${VISKA_DEMO_MAX_CHANNELS:-2}" '{
   keyboard_layout:$layout, backend:"mock", max_channels:$channels,
   submission_socket:($dir+"/submit.sock"),control_socket:($dir+"/control.sock"),
-  authorization:{store_users:[$user],type_users:[$user],output_users:[$user],clear_users:[$user],status_users:[$user]}
+  authorization:{send_users:[$user],type_users:[$user],output_users:[$user],clear_users:[$user],status_users:[$user]}
 }' > "$work/config.json"
 viskad --config "$work/config.json" &
 daemon_pid=$!
@@ -27,6 +27,6 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 viskactl status
-printf 'Mock demo (%s): use viskactl store/type/output/clear/status. Nothing is typed into host applications.\n' "$layout"
+printf 'Mock demo (%s): use viskactl send/type/output/clear/status. Nothing is typed into host applications.\n' "$layout"
 echo 'Exit the shell to stop the daemon and remove its private runtime directory.'
 bash --noprofile --norc -i

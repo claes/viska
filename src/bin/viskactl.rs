@@ -21,6 +21,17 @@ fn check() -> Result<()> {
         Ok(())
     }
 }
+fn wait_before_request(delay: Duration) -> Result<()> {
+    let start = viska::boottime();
+    loop {
+        check()?;
+        let elapsed = viska::boottime().saturating_sub(start);
+        if elapsed >= delay {
+            return Ok(());
+        }
+        std::thread::sleep((delay - elapsed).min(Duration::from_millis(50)));
+    }
+}
 fn receive(socket: &Socket, buffer: &mut Secret, deadline: Option<Duration>) -> Result<()> {
     buffer.clear();
     loop {
@@ -41,7 +52,8 @@ fn print_help(command: &str) {
     } else {
         let synopsis = match command {
             "send" => " [--recipient USER]",
-            "type" | "output" => " [--sync]",
+            "type" => " [--sync] [--delay-ms MS]",
+            "output" => " [--sync]",
             _ => "",
         };
         println!("Usage:\n  viskactl {command} [options]{synopsis}");
@@ -52,6 +64,9 @@ fn print_help(command: &str) {
     }
     if command.is_empty() || matches!(command, "type" | "output") {
         println!("\nConsumer options:\n  --sync             Wait for a value (type/output only)\n\n  Output writes exact bytes without adding a newline.\n  Type requires a matching layout and uses the focused destination.\n  A recipient restriction never grants an operation permission.");
+    }
+    if command.is_empty() || command == "type" {
+        println!("\nType options:\n  --delay-ms MS      Wait before requesting typing (default: 0 ms)\n\n  Gives time to release shortcut modifiers; does not detect release.\n  With --sync, waits before registering the consumer.");
     }
     println!("\nEnvironment:\n  VISKA_SOCKET_DIR   IPC directory, overridden by --socket-dir\n\nRequests are one-shot and never automatically retried.");
     if command.is_empty() || command == "send" {
@@ -70,6 +85,9 @@ fn print_help(command: &str) {
             }
         );
     }
+    if command.is_empty() || command == "type" {
+        println!("  viskactl type --delay-ms 500");
+    }
 }
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -85,6 +103,7 @@ fn run() -> Result<()> {
         recipient: None,
     };
     let mut help = false;
+    let mut delay_ms = None;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -98,9 +117,22 @@ fn run() -> Result<()> {
             "--socket-dir" => dir = iter.next().ok_or("missing socket directory")?.into(),
             "--channel" => r.channel = iter.next().ok_or("missing channel")?.clone(),
             "--sync" => r.sync = true,
+            "--delay-ms" => {
+                if delay_ms.is_some() {
+                    return Err("duplicate delay option");
+                }
+                let value = iter.next().ok_or("missing delay in milliseconds")?;
+                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err("delay must be an unsigned integer in milliseconds");
+                }
+                delay_ms = Some(value.parse::<u64>().map_err(|_| "delay is too large")?);
+            }
             _ if r.operation.is_empty() => r.operation = a.clone(),
             _ => return Err("unexpected argument"),
         }
+    }
+    if delay_ms.is_some() && r.operation != "type" {
+        return Err("--delay-ms is only supported on type");
     }
     if help {
         if !r.operation.is_empty()
@@ -126,6 +158,9 @@ fn run() -> Result<()> {
         libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
         libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    if let Some(ms) = delay_ms {
+        wait_before_request(Duration::from_millis(ms))?;
     }
     let mut input = if r.operation == "send" {
         Some(Secret::new(MAX_PAYLOAD + 1)?)

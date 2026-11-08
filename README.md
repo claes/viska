@@ -262,6 +262,28 @@ waiting. Authorization is checked again before delivering a future value.
 `--sync` is only supported on type/output. Store still acknowledges installation,
 without waiting for consumption. Status reports waiting and outputting states too.
 
+For a shortcut, `viskactl type --delay-ms 500` waits 500 milliseconds before
+connecting to the daemon. The default is zero; the argument must be an unsigned
+integer in milliseconds fitting in `u64`. This gives you time to release the
+shortcut modifiers; it does not detect their release. For example, with
+plasma-manager:
+
+```nix
+hotkeys.commands.viska-paste = {
+  name = "Viska Paste";
+  key = "Meta+Shift+V";
+  command = "${osConfig.services.viska.package}/bin/viskactl type --delay-ms 500";
+};
+```
+
+The option is only supported on `type`. With `--sync`, the delay happens before
+registering the waiting consumer. Ctrl-C or SIGTERM during the delay cancels
+without submitting a request. The delay does not reserve or extend the lifetime
+of a pending value: it can expire, be replaced, cleared, or consumed by another
+request. A clear during the delay cannot cancel the future request, since it has
+not yet reached the daemon. Once submitted, normal authorization and one-shot
+delivery rules apply.
+
 - TTL is 1–300 seconds, default 45, starting at installation and including suspend.
 - Default payload limit is 1 MiB per value. Replacement never installs partial data.
 - The channel limit counts pending values, staging, waiting, and active delivery.

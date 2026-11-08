@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import pwd
 import resource
+import signal
 import socket
 import subprocess
 import tempfile
@@ -306,5 +307,89 @@ class Service(unittest.TestCase):
         self.assertNotEqual(self.ctl('store',b'x').returncode,0)
         self.assertNotEqual(self.ctl('output',recipient=USER).returncode,0)
         self.assertFalse(self.raw([json.dumps(dict(version=2,operation='send',length=0)).encode()])['ok'])
+
+    def test_type_delay_and_zero(self):
+        self.send(b'public-fixture')
+        start = time.monotonic()
+        reader = subprocess.Popen([str(BIN/'viskactl'), 'type', '--delay-ms', '600'],
+                                  env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            time.sleep(.15)
+            self.assertIsNone(reader.poll())
+            self.assertEqual(self.status(), 'pending')
+            out, err = reader.communicate(timeout=5)
+            self.assertEqual(reader.returncode, 0, err)
+            self.assertEqual(out, b'')
+            self.assertGreaterEqual(time.monotonic() - start, .6)
+            self.assertEqual(self.status(), 'empty')
+            self.assertNotEqual(self.ctl('type').returncode, 0)
+        finally:
+            if reader.poll() is None: reader.terminate()
+            reader.communicate(timeout=5)
+        self.send(b'public-fixture')
+        result = subprocess.run([str(BIN/'viskactl'), 'type', '--delay-ms', '0'],
+                                env=self.env, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.status(), 'empty')
+
+    def test_type_delay_cancellation_and_sync(self):
+        self.send(b'public-fixture')
+        for sig in [signal.SIGINT, signal.SIGTERM]:
+            reader = subprocess.Popen([str(BIN/'viskactl'), 'type', '--delay-ms', str(2**64-1)],
+                                      env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                time.sleep(.15)
+                self.assertIsNone(reader.poll())
+                reader.send_signal(sig)
+                out, err = reader.communicate(timeout=2)
+                self.assertEqual(reader.returncode, 1, err)
+                self.assertIn(b'request cancelled', err)
+                self.assertEqual(out, b'')
+                self.assertEqual(self.status(), 'pending')
+            finally:
+                if reader.poll() is None: reader.terminate()
+                reader.communicate(timeout=5)
+        self.assertEqual(self.ctl('clear').returncode, 0)
+        start = time.monotonic()
+        reader = subprocess.Popen([str(BIN/'viskactl'), 'type', '--sync', '--delay-ms', '600'],
+                                  env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            time.sleep(.15)
+            self.assertIsNone(reader.poll())
+            self.assertEqual(self.status(), 'empty')
+            for _ in range(100):
+                if self.status() == 'waiting': break
+                time.sleep(.02)
+            else: self.fail('delayed consumer did not register')
+            self.assertGreaterEqual(time.monotonic() - start, .6)
+            self.send(b'public-fixture')
+            out, err = reader.communicate(timeout=5)
+            self.assertEqual(reader.returncode, 0, err)
+            self.assertEqual(out, b'')
+            self.assertEqual(self.status(), 'empty')
+        finally:
+            if reader.poll() is None: reader.terminate()
+            reader.communicate(timeout=5)
+
+    def test_delay_arguments_and_help_without_daemon_or_memlock(self):
+        env = dict(self.env, VISKA_SOCKET_DIR='/nonexistent')
+        for args in [['type', '--delay-ms'], ['type', '--delay-ms', '1', '--delay-ms', '2']] + [
+                ['type', '--delay-ms', value] for value in ['', '-1', '+1', '1.5', 'abc', '2ms', str(2**64)]] + [
+                [command, '--delay-ms', '0'] for command in ['send', 'output', 'clear', 'status']]:
+            result = subprocess.run([str(BIN/'viskactl'), *args], env=env, capture_output=True, timeout=2)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b'delay', result.stderr)
+        def no_memlock(): resource.setrlimit(resource.RLIMIT_MEMLOCK, (0, 0))
+        for args in [[], ['type', '--delay-ms', str(2**64-1)]]:
+            result = subprocess.run([str(BIN/'viskactl'), *args, '--help'], env=env,
+                                    preexec_fn=no_memlock, capture_output=True, timeout=2)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b'--delay-ms MS', result.stdout)
+            self.assertIn(b'default: 0 ms', result.stdout)
+        for command in ['send', 'output', 'clear', 'status']:
+            result = subprocess.run([str(BIN/'viskactl'), command, '--help'], env=env,
+                                    capture_output=True, timeout=2)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn(b'--delay-ms', result.stdout)
 
 if __name__ == '__main__': unittest.main(verbosity=2)
